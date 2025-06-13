@@ -392,7 +392,7 @@ class MetricsProcessor:
         self.logger.log(metrics, step)
 
         color = self.color
-        logger.info(
+        construct_string = str(
             f"{color.red}step: {step:2}  "
             f"{color.green}loss: {global_avg_loss:7.4f}  "
             f"{color.yellow}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
@@ -400,6 +400,14 @@ class MetricsProcessor:
             f"{color.blue}tps: {round(tps):,}  "
             f"{color.cyan}tflops: {tflops:,.2f}  "
             f"{color.magenta}mfu: {mfu:.2f}%{color.reset}"
+        )
+
+        if extra_metrics:
+            for k, v in extra_metrics.items():
+                if "loss" in k:
+                    construct_string += f"  {color.white}{k.lstrip('loss_metrics/')}: {v:7.4f}"
+        logger.info(
+            construct_string
         )
 
         self.ntokens_since_last_log = 0
