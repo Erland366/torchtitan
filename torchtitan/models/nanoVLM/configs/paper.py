@@ -165,7 +165,7 @@ def nanovlm_230m_vanilla_finevisionmax_nopack() -> Trainer.Config:
             visual_dependency_min_rating=1,
             formatting_min_rating=1,
         ),
-        metrics=MetricsProcessor.Config(log_freq=50, enable_wandb=True),
+        metrics=MetricsProcessor.Config(log_freq=50, enable_wandb=False),
         checkpoint=CheckpointManager.Config(
             enable=True,
             interval=500,
@@ -176,7 +176,7 @@ def nanovlm_230m_vanilla_finevisionmax_nopack() -> Trainer.Config:
             last_save_in_hf=True,
         ),
         activation_checkpoint=ActivationCheckpointConfig(
-            mode="nsel",
+            mode="selective",
         ),
         compile=CompileConfig(enable=True),
         debug=DebugConfig(seed=0),
