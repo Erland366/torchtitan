@@ -496,6 +496,7 @@ class MetricsProcessor(Configurable):
             "tflops": tflops,
             "mfu(%)": mfu,
             "time_metrics/end_to_end(s)": time_end_to_end,
+            "time_metrics/s_per_it": time_end_to_end,
             "time_metrics/data_loading(s)": time_data_loading,
             "time_metrics/data_loading(%)": time_data_loading_pct,
             "memory/max_active(GiB)": device_mem_stats.max_active_gib,
@@ -520,7 +521,8 @@ class MetricsProcessor(Configurable):
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "
             f"{color.blue}tps: {round(tps):,}  "
             f"{color.cyan}tflops: {tflops:,.2f}  "
-            f"{color.magenta}mfu: {mfu:.2f}%{color.reset}"
+            f"{color.magenta}mfu: {mfu:.2f}%  "
+            f"{color.reset}{time_end_to_end:.2f}s/it"
         )
 
         self.ntokens_since_last_log = 0

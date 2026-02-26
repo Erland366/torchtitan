@@ -773,7 +773,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         extra_metrics = {
             "n_tokens_seen": global_ntokens_seen,
             "lr": lr,
+            "train/batch_loss": global_avg_loss,
         }
+        # Harvest model-specific extra metrics (e.g., MoMH gates)
+        for model_part in self.model_parts:
+            if hasattr(model_part, "_nanovlm_extra_metrics"):
+                extra_metrics.update(model_part._nanovlm_extra_metrics)
+
         self.metrics_processor.log(
             self.step,
             global_avg_loss,

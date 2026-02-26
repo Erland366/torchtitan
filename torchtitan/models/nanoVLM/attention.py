@@ -1,0 +1,334 @@
+"""
+Mixture of Modality Heads (MoMH) Attention Module
+
+Implements specialized attention patterns where different heads focus on different modalities:
+- V-heads: Vision -> Vision only (bidirectional)
+- T-heads: Text -> Text only (causal)
+- VT-heads: Full cross-modal attention
+
+Uses PyTorch's flex_attention for efficient sparse attention computation.
+
+MoMH masking is driven by an explicit per-token modality mask (`is_vision`), typically derived
+from `<|image|>` placeholder token positions.
+"""
+
+import torch
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+
+# Compile flex_attention for performance
+# dynamic=False for prefill: fixed shapes, best performance
+# dynamic=True for decode: KV length grows each step, avoid recompilation
+flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
+flex_attention_compiled_dynamic = torch.compile(flex_attention, dynamic=True)
+
+# Increase dynamo cache for multiple mask configurations
+torch._dynamo.config.cache_size_limit = 1000
+
+
+def generate_momh_mask_mod_from_modality(
+    n_q_heads: int,
+    *,
+    is_vision: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    q_offset: int = 0,
+    n_v_heads: int,
+    n_t_heads: int,
+):
+    """
+    Generate a MoMH mask_mod based on per-token modality (vision vs text).
+
+    Args:
+        n_q_heads: Total number of query heads.
+        is_vision: Bool tensor [B, KV_LEN] marking vision tokens.
+        attention_mask: Optional tensor [B, KV_LEN], where 1=content and 0=padding.
+        q_offset: Absolute offset to map local q_idx into KV positions.
+        n_v_heads: Number of V->V heads.
+        n_t_heads: Number of T->T heads.
+
+    Returns:
+        mask_mod function compatible with flex_attention's create_block_mask.
+    """
+    if is_vision.dtype is not torch.bool:
+        is_vision = is_vision.to(torch.bool)
+    if attention_mask is not None and attention_mask.dtype is not torch.bool:
+        attention_mask = attention_mask.to(torch.bool)
+
+    H_V = n_v_heads
+    H_T = n_t_heads
+    H_T_start = H_V
+    H_VT_start = H_V + H_T
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        q_abs = q_idx + q_offset
+        kv_abs = kv_idx
+
+        if attention_mask is None:
+            not_padding = torch.ones_like(q_abs, dtype=torch.bool) & torch.ones_like(
+                kv_abs, dtype=torch.bool
+            )
+        else:
+            q_is_content = attention_mask[b, q_abs]
+            kv_is_content = attention_mask[b, kv_abs]
+            not_padding = q_is_content & kv_is_content
+
+        q_is_vision = is_vision[b, q_abs]
+        kv_is_vision = is_vision[b, kv_abs]
+        q_is_text = ~q_is_vision
+        kv_is_text = ~kv_is_vision
+
+        # V-heads: V->V only (bidirectional within vision tokens)
+        head_V = (h < H_T_start) & q_is_vision & kv_is_vision & not_padding
+
+        # T-heads: T->T only (causal within text tokens)
+        head_T = (
+            (h >= H_T_start)
+            & (h < H_VT_start)
+            & q_is_text
+            & kv_is_text
+            & (q_abs >= kv_abs)
+            & not_padding
+        )
+
+        # VT-heads: cross-modal (full vision + causal non-vision)
+        head_VT = (h >= H_VT_start) & not_padding & (kv_is_vision | (q_abs >= kv_abs))
+
+        return head_V | head_T | head_VT
+
+    return mask_mod
+
+
+def create_momh_block_mask_from_modality(
+    *,
+    n_q_heads: int,
+    q_len: int,
+    kv_len: int,
+    is_vision: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    n_v_heads: int,
+    n_t_heads: int,
+    device: str = "cuda",
+):
+    """
+    Create a MoMH BlockMask for arbitrary (Q_LEN, KV_LEN) shapes.
+    """
+    if is_vision.ndim != 2:
+        raise ValueError(
+            f"is_vision must have shape [B, KV_LEN], got {tuple(is_vision.shape)}"
+        )
+    if is_vision.shape[1] < kv_len:
+        raise ValueError(
+            f"is_vision second dim must be >= kv_len ({kv_len}), got {is_vision.shape[1]}"
+        )
+    if attention_mask is not None:
+        if attention_mask.ndim != 2:
+            raise ValueError(
+                f"attention_mask must have shape [B, KV_LEN], got {tuple(attention_mask.shape)}"
+            )
+        if attention_mask.shape[1] < kv_len:
+            raise ValueError(
+                f"attention_mask second dim must be >= kv_len ({kv_len}), got {attention_mask.shape[1]}"
+            )
+
+    q_offset = kv_len - q_len
+    mask_mod = generate_momh_mask_mod_from_modality(
+        n_q_heads,
+        is_vision=is_vision[:, :kv_len],
+        attention_mask=attention_mask[:, :kv_len] if attention_mask is not None else None,
+        q_offset=q_offset,
+        n_v_heads=n_v_heads,
+        n_t_heads=n_t_heads,
+    )
+
+    if torch.compiler.is_compiling():
+        return create_block_mask(
+            mask_mod,
+            B=is_vision.shape[0],
+            H=n_q_heads,
+            Q_LEN=q_len,
+            KV_LEN=kv_len,
+            device=device,
+        )
+
+    return create_block_mask(
+        mask_mod,
+        B=is_vision.shape[0],
+        H=n_q_heads,
+        Q_LEN=q_len,
+        KV_LEN=kv_len,
+        device=device,
+        _compile=True,
+    )
+
+
+def generate_base_structural_mask_mod(*, is_vision, attention_mask, q_offset=0):
+    """
+    Generate a head-independent mask_mod for soft-gated MoMH.
+
+    All heads share the same structural mask:
+    - Vision KV tokens are always accessible (bidirectional).
+    - Text KV tokens enforce causal ordering.
+    - Padding is masked out.
+    """
+    if is_vision.dtype is not torch.bool:
+        is_vision = is_vision.to(torch.bool)
+    if attention_mask is not None and attention_mask.dtype is not torch.bool:
+        attention_mask = attention_mask.to(torch.bool)
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        q_abs = q_idx + q_offset
+        kv_is_vision = is_vision[b, kv_idx]
+        is_causal = q_abs >= kv_idx
+        not_padding = attention_mask[b, q_abs] & attention_mask[b, kv_idx]
+        return not_padding & (kv_is_vision | is_causal)
+
+    return mask_mod
+
+
+def create_base_structural_block_mask(
+    *,
+    q_len: int,
+    kv_len: int,
+    is_vision: torch.Tensor,
+    attention_mask: torch.Tensor,
+    device: str = "cuda",
+):
+    """
+    Create a head-independent BlockMask for soft-gated MoMH.
+    Uses H=None so the mask broadcasts across all heads.
+    """
+    if is_vision.ndim != 2:
+        raise ValueError(
+            f"is_vision must have shape [B, KV_LEN], got {tuple(is_vision.shape)}"
+        )
+
+    q_offset = kv_len - q_len
+    mask_mod = generate_base_structural_mask_mod(
+        is_vision=is_vision[:, :kv_len],
+        attention_mask=attention_mask[:, :kv_len],
+        q_offset=q_offset,
+    )
+
+    if torch.compiler.is_compiling():
+        return create_block_mask(
+            mask_mod,
+            B=is_vision.shape[0],
+            H=None,
+            Q_LEN=q_len,
+            KV_LEN=kv_len,
+            device=device,
+        )
+
+    return create_block_mask(
+        mask_mod,
+        B=is_vision.shape[0],
+        H=None,
+        Q_LEN=q_len,
+        KV_LEN=kv_len,
+        device=device,
+        _compile=True,
+    )
+
+
+def create_causal_block_mask(
+    *,
+    q_len: int,
+    kv_len: int,
+    attention_mask: torch.Tensor,
+    device: str = "cuda",
+):
+    """
+    Create a head-independent causal BlockMask (no bidirectional vision).
+    Uses H=None so the mask broadcasts across all heads.
+    For use with momh_causal_gating: soft gates on top of standard causal attention.
+    """
+    if attention_mask is not None and attention_mask.dtype is not torch.bool:
+        attention_mask = attention_mask.to(torch.bool)
+
+    q_offset = kv_len - q_len
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        q_abs = q_idx + q_offset
+        is_causal = q_abs >= kv_idx
+        not_padding = attention_mask[b, q_abs] & attention_mask[b, kv_idx]
+        return not_padding & is_causal
+
+    if torch.compiler.is_compiling():
+        return create_block_mask(
+            mask_mod,
+            B=attention_mask.shape[0],
+            H=None,
+            Q_LEN=q_len,
+            KV_LEN=kv_len,
+            device=device,
+        )
+
+    return create_block_mask(
+        mask_mod,
+        B=attention_mask.shape[0],
+        H=None,
+        Q_LEN=q_len,
+        KV_LEN=kv_len,
+        device=device,
+        _compile=True,
+    )
+
+
+def generate_soft_gating_score_mod(
+    *, momh_gate, is_vision, q_offset=0, active_pairs="all"
+):
+    """
+    Generate a score_mod that adds learnable per-head modality bias.
+
+    The bias is indexed by (query_modality, kv_modality) pair:
+        pair_idx = q_mod * 2 + kv_mod
+        0=text-text, 1=text-vision, 2=vision-text, 3=vision-vision
+
+    Args:
+        momh_gate: Parameter tensor [n_heads, 4] with per-head modality biases.
+        is_vision: Bool tensor [B, KV_LEN] marking vision tokens.
+        q_offset: Offset to map local q_idx into absolute KV positions.
+        active_pairs: "all" for all 4 pairs, "tt_tv" for text-query pairs only.
+
+    Returns:
+        score_mod function for flex_attention.
+    """
+    if is_vision.dtype is not torch.bool:
+        is_vision = is_vision.to(torch.bool)
+
+    B_size, kv_len = is_vision.shape
+    n_heads = momh_gate.shape[0]
+
+    # Precompute bias tables
+    kv_mod = is_vision.to(torch.int64)  # [B, KV_LEN]
+
+    # q=text: pair_idx = 0*2 + kv_mod -> {0=tt, 1=tv}
+    pair_idx_q_text = kv_mod
+    # q=vision: pair_idx = 1*2 + kv_mod -> {2=vt, 3=vv}
+    pair_idx_q_vis = 2 + kv_mod
+
+    pair_q_text_flat = (
+        pair_idx_q_text.unsqueeze(0).expand(n_heads, -1, -1).reshape(n_heads, -1)
+    )
+    pair_q_vis_flat = (
+        pair_idx_q_vis.unsqueeze(0).expand(n_heads, -1, -1).reshape(n_heads, -1)
+    )
+
+    bias_if_q_text = momh_gate.gather(1, pair_q_text_flat).reshape(
+        n_heads, B_size, kv_len
+    )
+    bias_if_q_vis = momh_gate.gather(1, pair_q_vis_flat).reshape(
+        n_heads, B_size, kv_len
+    )
+
+    if active_pairs == "tt_tv":
+        bias_if_q_vis = torch.zeros_like(bias_if_q_vis)
+
+    def score_mod(score, b, h, q_idx, kv_idx):
+        q_abs = q_idx + q_offset
+        q_is_vis = is_vision[b, q_abs]
+        bias = torch.where(
+            q_is_vis, bias_if_q_vis[h, b, kv_idx], bias_if_q_text[h, b, kv_idx]
+        )
+        return score + bias
+
+    return score_mod
