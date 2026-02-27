@@ -27,4 +27,3 @@ eg, for Qwen3 0.6B model, the HF repo name is `Qwen/Qwen3-0.6B`. For 1.7B model,
 - Testing
     - Learning rate verifying: verify learning rate and schedule with real training jobs (eg, 3k stps), or find official references.
     - The model should be tested against established performance benchmarks
-    - CI integration

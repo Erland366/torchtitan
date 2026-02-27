@@ -67,7 +67,7 @@ The folder should be organized as follows
   - For comparisons within `torchtitan`, see the [guidelines](/docs/converging.md).
 - Performance benchmarking
   - Please refer to the [benchmarks](/benchmarks/) folder.
-- CI tests
-  - Including unit tests and integration tests, see [examples](/tests/).
+- Tests
+  - Include unit tests and integration tests, see [examples](/tests/).
   - If the model folder is under the experiments folder, put the tests under the model folder. Otherwise, put the tests under the `/tests` folder.
-  - Add necessary GitHub [workflows](/.github/workflows/).
+  - Ensure tests can be run locally by contributors.

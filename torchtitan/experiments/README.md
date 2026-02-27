@@ -11,7 +11,7 @@ We provide this `experiments/` folder to host experiments that add significant v
     - The extension points are subject to change. We kindly request that contributors provide feedback if they encounter issues reusing any components, rather than simply using a copy-and-paste approach.
     - The degree to which existing components are reused and whether duplications are legit will also be a criteria of whether an experiment would be accepted.
 4. Each experiment is independent from other experiments, and can have its own dependencies (on top of [core dependencies](../../requirements.txt)), and its own tests. An experiment should not contain vendor-specific code, such as kernels written in a proprietary language. Those can be hosted outside as dependency.
-5. The dependency from `experiments` to `core` is one-way. Anything in `experiments` is optional for `core` to run successfully. In particular, development in `core` is not blocked by breakage in `experiments`. We will utilize GitHub's [CI mechanism](https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#onpushpull_requestpull_request_targetpathspaths-ignore) to help test an experiment periodically and only if the experiment itself is affected by a PR.
+5. The dependency from `experiments` to `core` is one-way. Anything in `experiments` is optional for `core` to run successfully. In particular, development in `core` is not blocked by breakage in `experiments`. Experiment owners are expected to validate changes with local tests for the experiment and any touched `core` paths.
 6. Each experiment needs to have an owner. The owner is responsible to work with `torchtitan` team to maintain the quality and healthiness of an experiment, which includes
     - adapting an experiment to changes in `core` and fix broken tests, no later than the next official `torchtitan` release;
     - responding to GitHub issues and questions in a timely manner.
@@ -22,14 +22,14 @@ We provide this `experiments/` folder to host experiments that add significant v
 
 ## Current experiments
 
-| Experiment | Test Status | Owners |
-| ----- | ----: | ----: |
-| [simple_fsdp](./simple_fsdp/) | [![SimpleFSDP 8 GPU Integration Tests](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu_simple_fsdp.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu_simple_fsdp.yaml?query=branch%3Amain) | [@ruisizhang123](https://github.com/ruisizhang123) [@tianyu-l](https://github.com/tianyu-l) |
-| [compiler_toolkit](./compiler_toolkit/) | [![Compiler Toolkit 8 GPU Integration Tests](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu_compiler_toolkit.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu_compiler_toolkit.yaml?query=branch%3Amain) | [@SherlockNoMad](https://github.com/SherlockNoMad) [@yiming0416](https://github.com/yiming0416) |
-| [autoparallel](./autoparallel/) | [![Auto Parallel 8 GPU Integration Tests](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu_autoparallel.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu_autoparallel.yaml?query=branch%3Amain) | [@wconstab](https://github.com/wconstab) [@xmfan](https://github.com/xmfan) |
-| [torchcomms](./torchcomms/) | [![TorchComms 8 GPU Integration Tests](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu_torchcomms.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu_torchcomms.yaml?query=branch%3Amain) | [@d4l3k](https://https://github.com/d4l3k) [@fduwjj](https://github.com/fduwjj) [@mori360 ](https://github.com/mori360) |
-| [ft](./ft/) | [![TorchFT 8 GPU Integration Tests](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu_torchft.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu_torchft.yaml?query=branch%3Amain) | [@tushar00jain](https://github.com/tushar00jain) [@fegin](https://github.com/fegin) |
-| [vlm](./vlm/) | [![VLM 8 GPU Integration Tests](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu_vlm.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu_vlm.yaml?query=branch%3Amain) | [@lkhphuc](https://github.com/lkhphuc) [@shuhuayu](https://github.com/shuhuayu) |
-| [transformers_modeling_backend](./transformers_modeling_backend/) | [![Transformers modeling backend 8 GPU Integration Tests](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu_transformers_modeling_backend.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_8gpu_transformers_modeling_backend.yaml?query=branch%3Amain) | [@3outeille](https://github.com/3outeille) |
-| [rl](./rl/) | TBA | [@wwwjn](https://github.com/wwwjn) |
-| [forge](./forge/) | TBA | [@allenwang28](https://github.com/allenwang28) [@joecummings](https://github.com/joecummings) [@felipemello1](https://github.com/felipemello1) [@daniellepintz](https://github.com/daniellepintz) |
+| Experiment | Owners |
+| ----- | ----: |
+| [simple_fsdp](./simple_fsdp/) | [@ruisizhang123](https://github.com/ruisizhang123) [@tianyu-l](https://github.com/tianyu-l) |
+| [compiler_toolkit](./compiler_toolkit/) | [@SherlockNoMad](https://github.com/SherlockNoMad) [@yiming0416](https://github.com/yiming0416) |
+| [autoparallel](./autoparallel/) | [@wconstab](https://github.com/wconstab) [@xmfan](https://github.com/xmfan) |
+| [torchcomms](./torchcomms/) | [@d4l3k](https://https://github.com/d4l3k) [@fduwjj](https://github.com/fduwjj) [@mori360 ](https://github.com/mori360) |
+| [ft](./ft/) | [@tushar00jain](https://github.com/tushar00jain) [@fegin](https://github.com/fegin) |
+| [vlm](./vlm/) | [@lkhphuc](https://github.com/lkhphuc) [@shuhuayu](https://github.com/shuhuayu) |
+| [transformers_modeling_backend](./transformers_modeling_backend/) | [@3outeille](https://github.com/3outeille) |
+| [rl](./rl/) | [@wwwjn](https://github.com/wwwjn) |
+| [forge](./forge/) | [@allenwang28](https://github.com/allenwang28) [@joecummings](https://github.com/joecummings) [@felipemello1](https://github.com/felipemello1) [@daniellepintz](https://github.com/daniellepintz) |

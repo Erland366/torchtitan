@@ -1,1 +1,2 @@
-../../../.ci/docker/requirements-flux.txt
+transformers>=4.51.1
+sentencepiece
