@@ -46,7 +46,11 @@ class NanoVLMStateDictAdapter(BaseStateDictAdapter):
         """
         hf_sd: dict[str, Any] = {}
 
-        for key, tensor in state_dict.items():
+        for raw_key, tensor in state_dict.items():
+            # Canonicalize compiled wrapper keys so eager/compiled models map
+            # identically when exporting to HF format.
+            key = raw_key.replace("._orig_mod.", ".")
+
             # Skip the nn.ModuleDict alias (layers == blocks for vision encoder)
             if key.startswith("vision_encoder.layers."):
                 continue
@@ -130,7 +134,11 @@ class NanoVLMStateDictAdapter(BaseStateDictAdapter):
         native_sd: dict[str, Any] = {}
         cfg = self.model_config
 
-        for key, tensor in hf_state_dict.items():
+        for raw_key, tensor in hf_state_dict.items():
+            # Checkpoints saved from compiled modules include `._orig_mod.` in keys.
+            # Strip it so they map to the eager module names used by torchtitan.
+            key = raw_key.replace("._orig_mod.", ".")
+
             # Skip rotary embedding buffer (recomputed on load)
             if "rotary_embd" in key:
                 continue

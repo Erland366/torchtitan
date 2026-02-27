@@ -32,6 +32,13 @@ from torchtitan.tools.logging import logger
 random.seed(42)
 
 
+def _seed_worker(worker_id: int) -> None:
+    del worker_id
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 # ========================== Image Utilities ==========================
 
 
@@ -633,10 +640,17 @@ class NanoVLMIterableDataset(IterableDataset, Stateful):
 
         self._streaming = streaming
         self._sample_idx = 0
+        dataset_config = dataset_name[0]
+        if dataset_config in ("default", "", None):
+            dataset_config = None
 
         if streaming:
             hf_dataset = load_dataset(
-                dataset_path, name=dataset_name[0], split="train", streaming=True
+                dataset_path,
+                name=dataset_config,
+                split="train",
+                streaming=True,
+                on_bad_files="warn",
             )
             hf_dataset = split_dataset_by_node(
                 hf_dataset, rank=dp_rank, world_size=dp_world_size
@@ -644,7 +658,10 @@ class NanoVLMIterableDataset(IterableDataset, Stateful):
             self._hf_data = hf_dataset
         else:
             hf_dataset = load_dataset(
-                dataset_path, name=dataset_name[0], split="train"
+                dataset_path,
+                name=dataset_config,
+                split="train",
+                on_bad_files="warn",
             )
             if dp_world_size > 1:
                 hf_dataset = hf_dataset.shard(
@@ -666,7 +683,6 @@ class NanoVLMIterableDataset(IterableDataset, Stateful):
         self.use_packing = use_packing
         self.seq_len = seq_len
         self.image_token_id = image_token_id
-        self.collator = VQACollator(tokenizer, max_length=seq_len)
 
         if use_packing:
             self.packed_dataset = ConstantLengthDataset(
@@ -683,52 +699,23 @@ class NanoVLMIterableDataset(IterableDataset, Stateful):
     def __iter__(self):
         if self.use_packing:
             for sample in self.packed_dataset:
-                # Already packed to seq_len, wrap as batch
-                images_tensor = self._process_images(sample["images"])
                 self._sample_idx += 1
-                yield (
-                    {
-                        "input": sample["input_ids"].unsqueeze(0),
-                        "images": images_tensor,
-                        "attention_mask": sample["attention_mask"].unsqueeze(0),
-                    },
-                    sample["labels"].unsqueeze(0),
-                )
+                # Yield raw sample dict; batch-level collation is handled by
+                # DataLoader collate_fn for parity with nanoVLM_main.
+                yield sample
         elif self._streaming:
             for sample in self.vqa_dataset.iter_for_worker():
                 if sample is None:
                     continue
-                batch = self.collator([sample])
-                if len(batch["input_ids"]) == 0:
-                    continue
                 self._sample_idx += 1
-                images_tensor = self._process_images(batch["images"])
-                yield (
-                    {
-                        "input": batch["input_ids"],
-                        "images": images_tensor,
-                        "attention_mask": batch["attention_mask"],
-                    },
-                    batch["labels"],
-                )
+                yield sample
         else:
             for idx in range(len(self.vqa_dataset)):
                 sample = self.vqa_dataset[idx]
                 if sample is None:
                     continue
-                batch = self.collator([sample])
-                if len(batch["input_ids"]) == 0:
-                    continue
                 self._sample_idx += 1
-                images_tensor = self._process_images(batch["images"])
-                yield (
-                    {
-                        "input": batch["input_ids"],
-                        "images": images_tensor,
-                        "attention_mask": batch["attention_mask"],
-                    },
-                    batch["labels"],
-                )
+                yield sample
 
     def state_dict(self):
         if self._streaming and self._hf_data is not None:
@@ -742,21 +729,6 @@ class NanoVLMIterableDataset(IterableDataset, Stateful):
         self._sample_idx = state_dict.get("sample_idx", 0)
         if self._streaming and self._hf_data is not None and "data" in state_dict:
             self._hf_data.load_state_dict(state_dict["data"])
-
-    def _process_images(self, images):
-        """Flatten nested image lists and stack into a single tensor."""
-        if isinstance(images, list):
-            flat = []
-            for img in images:
-                if isinstance(img, list):
-                    flat.extend(img)
-                elif isinstance(img, torch.Tensor):
-                    flat.append(img)
-            if not flat:
-                return torch.zeros(0, 3, 1, 1)
-            return torch.cat(flat, dim=0) if flat[0].ndim == 4 else torch.stack(flat, dim=0)
-        return images
-
 
 # ========================== DataLoader ==========================
 
@@ -782,7 +754,7 @@ class NanoVLMDataLoader(ParallelAwareDataloader):
         max_img_size: int = 1024
         resize_to_max_side_len: bool = False
         streaming: bool = False
-        packing_num_sequences: int = 1024
+        packing_num_sequences: int | None = None
         image_token_id: int = -1  # Set dynamically
 
     def __init__(
@@ -800,10 +772,21 @@ class NanoVLMDataLoader(ParallelAwareDataloader):
             config.tokenizer_name,
             extra_special_tokens=VLM_EXTRA_TOKENS,
             chat_template=LM_CHAT_TEMPLATE,
+            model_max_length=config.max_sample_length,
         )
 
         image_token_id = int(nanovlm_tokenizer.image_token_id)
         config.image_token_id = image_token_id
+        collator_max_len = seq_len if config.use_packing else config.max_sample_length
+        self._vqa_collator = VQACollator(
+            nanovlm_tokenizer,
+            max_length=collator_max_len,
+        )
+        packing_num_sequences = (
+            config.packing_num_sequences
+            if config.packing_num_sequences is not None
+            else local_batch_size * 4
+        )
 
         image_processor = get_image_processor(
             max_img_size=config.max_img_size,
@@ -820,7 +803,7 @@ class NanoVLMDataLoader(ParallelAwareDataloader):
             seq_len=seq_len,
             use_packing=config.use_packing,
             streaming=config.streaming,
-            packing_num_sequences=config.packing_num_sequences,
+            packing_num_sequences=packing_num_sequences,
             max_sample_length=config.max_sample_length,
             max_images_per_example=config.max_images_per_example,
             max_images_per_knapsack=config.max_images_per_knapsack,
@@ -838,43 +821,59 @@ class NanoVLMDataLoader(ParallelAwareDataloader):
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             batch_size=local_batch_size,
+            drop_last=True,
             collate_fn=self._collate_fn,
             num_workers=config.num_workers,
             persistent_workers=config.persistent_workers if config.num_workers > 0 else False,
             pin_memory=config.pin_memory,
             prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None,
+            worker_init_fn=_seed_worker,
+            generator=torch.Generator().manual_seed(0),
         )
 
         self._image_token_id = image_token_id
 
-    @staticmethod
-    def _collate_fn(batch):
-        """Collate pre-formatted (input_dict, labels) tuples from the iterable dataset."""
-        input_dicts, labels_list = zip(*batch)
+    def _collate_fn(self, batch: list[dict[str, Any]]):
+        """Mirror nanoVLM_main collation, then adapt to torchtitan tuple format."""
+        collated = self._vqa_collator(batch)
+        if len(collated["input_ids"]) == 0:
+            empty = torch.zeros(0, 0, dtype=torch.long)
+            return (
+                {
+                    "input": empty,
+                    "images": torch.zeros(0, 3, 1, 1),
+                    "attention_mask": empty,
+                },
+                empty,
+            )
 
-        # Stack inputs
-        all_inputs = torch.cat([d["input"] for d in input_dicts], dim=0)
-        all_attention = torch.cat([d["attention_mask"] for d in input_dicts], dim=0)
-        all_labels = torch.cat(labels_list, dim=0)
-
-        # Collect all images
-        all_images = []
-        for d in input_dicts:
-            if d["images"].numel() > 0:
-                all_images.append(d["images"])
-        if all_images:
-            all_images_tensor = torch.cat(all_images, dim=0)
-        else:
-            all_images_tensor = torch.zeros(0, 3, 1, 1)
-
+        images_tensor = self._flatten_images(collated["images"])
         return (
             {
-                "input": all_inputs,
-                "images": all_images_tensor,
-                "attention_mask": all_attention,
+                "input": collated["input_ids"],
+                "images": images_tensor,
+                "attention_mask": collated["attention_mask"],
             },
-            all_labels,
+            collated["labels"],
         )
+
+    @staticmethod
+    def _flatten_images(images: list[Any]) -> torch.Tensor:
+        """Flatten collated per-sample image containers into a single image tensor."""
+        flat_images: list[torch.Tensor] = []
+        for sample_images in images:
+            if isinstance(sample_images, list):
+                for image in sample_images:
+                    if isinstance(image, torch.Tensor):
+                        flat_images.append(image)
+            elif isinstance(sample_images, torch.Tensor):
+                flat_images.append(sample_images)
+
+        if not flat_images:
+            return torch.zeros(0, 3, 1, 1)
+        if flat_images[0].ndim == 4:
+            return torch.cat(flat_images, dim=0)
+        return torch.stack(flat_images, dim=0)
 
     @property
     def image_token_id(self) -> int:

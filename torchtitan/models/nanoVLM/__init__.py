@@ -135,7 +135,7 @@ nanovlm_configs = {
         lm_n_heads=9,
         lm_n_kv_heads=3,
         lm_n_blocks=30,
-        lm_max_position_embeddings=8192,
+        lm_max_position_embeddings=2048,
         lm_vocab_size=49218,
         lm_tie_weights=True,
         # Projector
@@ -147,8 +147,32 @@ nanovlm_configs = {
         momh_kv_groups_text=0,
         momh_soft_gating=True,
         momh_soft_gating_init="zero",
+        momh_soft_gating_pairs="tt_tv",
     ),
     "230m_vanilla": NanoVLMModel.Config(
+        # Vision — SigLIP2-base
+        vit_hidden_dim=768,
+        vit_inter_dim=3072,
+        vit_patch_size=16,
+        vit_img_size=512,
+        vit_n_heads=12,
+        vit_n_blocks=12,
+        # Language — SmolLM2-135M
+        lm_hidden_dim=576,
+        lm_inter_dim=1536,
+        lm_n_heads=9,
+        lm_n_kv_heads=3,
+        lm_n_blocks=30,
+        lm_max_position_embeddings=2048,
+        lm_vocab_size=49218,
+        lm_tie_weights=True,
+        # Projector
+        mp_pixel_shuffle_factor=4,
+        mp_image_token_length=64,
+        # No MoMH
+        momh_enabled=False,
+    ),
+    "230m_vanilla_8k": NanoVLMModel.Config(
         # Vision — SigLIP2-base
         vit_hidden_dim=768,
         vit_inter_dim=3072,

@@ -100,7 +100,12 @@ def _build_param_groups(
                 f"(lr=0 → requires_grad=False)"
             )
             continue
-        group = {"params": params, "lr": lr}
+        group = {
+            "params": params,
+            "lr": lr,
+            "name": group_name,
+            "max_lr": lr,
+        }
         groups.append(group)
         logger.info(
             f"Optimizer group '{group_name}': {len(params)} params, lr={lr}"

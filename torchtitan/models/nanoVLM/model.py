@@ -781,7 +781,9 @@ class NanoVLMModel(BaseModel):
         # Token embeddings
         h = self.tok_embeddings(tokens)
 
-        # Vision processing: encode images and scatter into token embeddings
+        # Vision processing: images must be pre-collated as a single tensor.
+        if isinstance(images, list):
+            raise TypeError("Expected `images` to be a tensor, got list")
         if images is not None and images.numel() > 0:
             image_embd = self.vision_encoder(images)
             image_embd = self.projector(image_embd)
