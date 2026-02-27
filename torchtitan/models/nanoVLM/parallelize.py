@@ -63,10 +63,7 @@ def parallelize_nanovlm(
         )
         apply_ac(model.vision_encoder, ac_config)
 
-    # 2. Per-block compile (after AC, before FSDP)
-    # Only compile LM decoder blocks — NOT the vision encoder.
-    # The ViT image-batch dimension varies per step, causing repeated
-    # recompiles and wasted GPU memory (same as nanoVLM_main).
+    # 2. Use the native Torchtitan per-block compile path.
     if model_compile_enabled:
         apply_compile(model, compile_config)
 
