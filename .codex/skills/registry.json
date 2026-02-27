@@ -1,0 +1,34 @@
+{
+  "domain": "research",
+  "version": "1.0.0",
+  "created": "2026-02-26",
+  "updated": "2026-02-27",
+  "skills": {
+    "domain-advisor": {
+      "type": "core",
+      "description": "Plan experiments using past knowledge"
+    },
+    "domain-retrospective": {
+      "type": "core",
+      "description": "Document findings as reusable skills"
+    },
+    "torchtitan-vanilla-parity-recipe": {
+      "type": "result",
+      "description": "Checklist for preserving vanilla loss parity while validating speed/VRAM"
+    },
+    "torchtitan-vram-gap-triage": {
+      "type": "result",
+      "description": "Methodical triage flow for residual VRAM gap after parity is achieved"
+    },
+    "torchtitan-soft-gating-parity-guardrails": {
+      "type": "result",
+      "description": "Guardrails for soft-gating ports that are fast/low-memory but still numerically divergent"
+    }
+  },
+  "paths": {
+    "reports": "training_reports/",
+    "experiment_log": "references/experiment-log.md",
+    "troubleshooting": "references/troubleshooting.md",
+    "templates": "templates/"
+  }
+}
