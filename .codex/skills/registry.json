@@ -2,7 +2,7 @@
   "domain": "research",
   "version": "1.0.0",
   "created": "2026-02-26",
-  "updated": "2026-02-27",
+  "updated": "2026-02-28",
   "skills": {
     "domain-advisor": {
       "type": "core",
@@ -23,6 +23,10 @@
     "torchtitan-soft-gating-parity-guardrails": {
       "type": "result",
       "description": "Guardrails for soft-gating ports that are fast/low-memory but still numerically divergent"
+    },
+    "torchtitan-parity-harness-resilience": {
+      "type": "result",
+      "description": "Rules to keep paired parity benchmarks valid when baseline teardown crashes occur after full completion"
     }
   },
   "paths": {

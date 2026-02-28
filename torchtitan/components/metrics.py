@@ -148,7 +148,9 @@ class WandBLogger(BaseLogger):
         os.makedirs(log_dir, exist_ok=True)
 
         self.wandb.init(
-            entity=os.getenv("WANDB_TEAM", None),
+            # Keep backward compatibility with WANDB_TEAM while supporting the
+            # standard WANDB_ENTITY name used by nanoVLM_main workflows.
+            entity=os.getenv("WANDB_ENTITY") or os.getenv("WANDB_TEAM", None),
             project=os.getenv("WANDB_PROJECT", "torchtitan"),
             name=os.getenv("WANDB_RUN_NAME", None),
             id=os.getenv("WANDB_RUN_ID", None),

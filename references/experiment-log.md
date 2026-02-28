@@ -14,7 +14,62 @@ Each entry should include:
 
 <!-- New entries go above this line -->
 
+## 2026-02-28
+
+- **Date**: 2026-02-28
+- **Type**: Retrospective
+- **General description**: Soft-gating parity remains the blocker after speed and VRAM targets were met.
+- **Details**:
+  - Final paired 100-step soft-gating benchmark (`soft-gating-clipfix-final2-20260228-022309`) completed baseline and Torchtitan successfully.
+  - Baseline run `3j50m01e`: elapsed `462.50s`, peak `28521 MiB`, median TPS `7380.94`.
+  - Torchtitan run `igb9fybu`: elapsed `374.78s`, peak `22105 MiB`, median TPS `39525`.
+  - Loss parity still fails strict exact-match requirement:
+    - mean abs diff `0.0066478`, max abs diff `0.16272` at step `9`.
+  - Reference variability check indicates baseline itself is unstable early:
+    - baseline-vs-baseline (100-step) mean abs diff `0.004764`, max abs diff `0.1469` at step `9`.
+  - Next debugging focus should isolate early-step numeric drift sources in soft-gating while preserving achieved speed/VRAM gains.
+
+- **Date**: 2026-02-28
+- **Type**: Observation
+- **General description**: Aligned gradient clipping path with nanoVLM_main for non-PP/EP runs.
+- **Details**:
+  - Updated Torchtitan train-step clipping in [trainer.py](/home/coder/edd/nanoVLM_root/torchtitan/torchtitan/trainer.py) to use `torch.nn.utils.clip_grad_norm_` directly when PP/EP are disabled.
+  - Kept Torchtitan distributed clipper only for PP/EP paths where cross-mesh norm reduction is required.
+  - This removes an implementation mismatch where Torchtitan always used the distributed clipper with explicit `foreach=True`.
+
+- **Date**: 2026-02-28
+- **Type**: Observation
+- **General description**: Hardened parity benchmark harness against baseline teardown crashes that happen after full-step completion.
+- **Details**:
+  - Extended [nanovlm_parity_benchmark.py](/home/coder/edd/nanoVLM_root/torchtitan/scripts/nanovlm_parity_benchmark.py) to continue when baseline exits non-zero only after logging all target steps and matching known shutdown signatures.
+  - Added unit coverage in [test_nanovlm_parity_benchmark.py](/home/coder/edd/nanoVLM_root/torchtitan/tests/unit_tests/test_nanovlm_parity_benchmark.py).
+  - This prevents false-negative benchmark aborts and allows paired Torchtitan runs to execute to completion.
+
+- **Date**: 2026-02-28
+- **Type**: Retrospective
+- **General description**: Re-ran 100-step soft-gating parity with clipping and harness fixes.
+- **Details**:
+  - Output directory: `outputs/nanovlm_parity_benchmarks/soft-gating-clipfix-final2-20260228-022309`.
+  - Baseline W&B run: `3j50m01e` (`patrickirawan-mbzuai/momh`), elapsed `462.50s`, peak VRAM `28521 MiB`, median TPS (excluding step 1) `7380.94`.
+  - Torchtitan W&B run: `igb9fybu` (`patrickirawan-mbzuai/momh`), elapsed `374.78s`, peak VRAM `22105 MiB`, median TPS (excluding step 1) `39525`.
+  - Loss comparison over 100 paired steps:
+    - mean absolute difference `0.0066478`,
+    - max absolute difference `0.16272` at step `9`.
+  - Outcome vs goals:
+    - speed: improved (Torchtitan faster),
+    - VRAM: reduced (Torchtitan lower),
+    - loss: still not exact-match for soft-gating.
+
 ## 2026-02-27
+
+- **Date**: 2026-02-27
+- **Type**: Observation
+- **General description**: Identified a soft-gating parity mismatch in optimizer parameter grouping.
+- **Details**:
+  - In `nanoVLM_main`, `momh_gate` parameters are only split into their own optimizer group when `lr_momh_gate` is explicitly set.
+  - In Torchtitan, `momh_gate` was always split as a separate optimizer group, even when `lr_momh_gate=None`.
+  - This mismatch is present in the `soft-gating-soft100-vramfix-clean1` logs where Torchtitan reports `Optimizer group 'momh_gate': 30 params, lr=0.0001` while baseline uses the language group for gates.
+  - Planned fix: make Torchtitan gate-group splitting conditional on `lr_momh_gate is not None` and re-run soft-gating parity benchmarks.
 
 - **Date**: 2026-02-27
 - **Type**: Retrospective

@@ -790,13 +790,22 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 if param.grad is not None:
                     param.grad.mul_(grad_scale)
 
-        grad_norm = dist_utils.clip_grad_norm_(
-            [p for m in self.model_parts for p in m.parameters()],
-            self.config.training.max_norm,
-            foreach=True,
-            pp_mesh=parallel_dims.get_optional_mesh("pp"),
-            ep_enabled=parallel_dims.ep_enabled,
-        )
+        params = [p for m in self.model_parts for p in m.parameters()]
+        pp_mesh = parallel_dims.get_optional_mesh("pp")
+        if pp_mesh is None and not parallel_dims.ep_enabled:
+            # Keep parity with nanoVLM_main when no PP/EP mesh is active.
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                params,
+                self.config.training.max_norm,
+            )
+        else:
+            grad_norm = dist_utils.clip_grad_norm_(
+                params,
+                self.config.training.max_norm,
+                foreach=None,
+                pp_mesh=pp_mesh,
+                ep_enabled=parallel_dims.ep_enabled,
+            )
         manual_lr = self._maybe_apply_nanovlm_manual_lr()
         self.checkpointer.maybe_wait_for_staging()
         self.optimizers.step()

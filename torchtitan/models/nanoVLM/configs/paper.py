@@ -111,7 +111,7 @@ def nanovlm_230m_structural_gating_finevisionmax_nopack() -> Trainer.Config:
         activation_checkpoint=ActivationCheckpointConfig(
             mode="none",
         ),
-        compile=CompileConfig(enable=True, components=["model"]),
+        compile=CompileConfig(enable=True, components=["model", "loss"]),
         debug=DebugConfig(seed=0),
     )
 
@@ -188,7 +188,7 @@ def nanovlm_230m_vanilla_finevisionmax_nopack() -> Trainer.Config:
         activation_checkpoint=ActivationCheckpointConfig(
             mode="none",
         ),
-        compile=CompileConfig(enable=True, components=["model"]),
+        compile=CompileConfig(enable=True, components=["model", "loss"]),
         debug=DebugConfig(seed=0),
     )
 
@@ -419,6 +419,6 @@ def nanovlm_230m_momh_soft_gating_b5_tttv_nopack() -> Trainer.Config:
         activation_checkpoint=ActivationCheckpointConfig(
             mode="none",
         ),
-        compile=CompileConfig(enable=True, components=["model"]),
+        compile=CompileConfig(enable=True, components=["model", "loss"]),
         debug=DebugConfig(seed=0),
     )

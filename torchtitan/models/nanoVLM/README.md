@@ -17,9 +17,9 @@ The paper config is set to mirror `nanoVLM_main/configs/train.paper.vanilla-fine
   - cosine decay to `0.1 * max_lr`
 - Compile scope aligned with original behavior:
   - compile model blocks
+  - compile loss (fuses logits->CE path and reduces peak reserved VRAM)
   - use Torchtitan native per-block compile path (`apply_compile`)
     rather than a custom nanoVLM forward-wrapper compile
-  - keep loss uncompiled
 - Data filtering aligned with original dataset processing:
   - `relevance_ratings`
   - `image_correspondence_ratings`
@@ -56,6 +56,38 @@ consistent.
 
 Torchtitan reads W&B settings from environment variables:
 
-- Team/entity: `WANDB_TEAM`
+- Team/entity: `WANDB_ENTITY` (or backward-compatible `WANDB_TEAM`)
 - Project: `WANDB_PROJECT`
 - Run name: `WANDB_RUN_NAME`
+
+## 100-Step A/B Parity Benchmark
+
+Use the parity benchmark runner to execute `nanoVLM_main` and Torchtitan
+back-to-back with:
+
+- synchronized 100-step setup
+- external `nvidia-smi` VRAM sampling
+- parsed per-step loss/tps summaries
+- JSON + Markdown output artifacts
+
+Example (vanilla):
+
+```bash
+source ../nanoVLM_main/.venv/bin/activate && \
+python scripts/nanovlm_parity_benchmark.py \
+  --mode vanilla \
+  --steps 100 \
+  --wandb-entity patrickirawan-mbzuai \
+  --wandb-project momh
+```
+
+Example (soft-gating):
+
+```bash
+source ../nanoVLM_main/.venv/bin/activate && \
+python scripts/nanovlm_parity_benchmark.py \
+  --mode soft-gating \
+  --steps 100 \
+  --wandb-entity patrickirawan-mbzuai \
+  --wandb-project momh
+```

@@ -71,19 +71,26 @@ def _build_param_groups(
         elif name.startswith("projector."):
             projector_params.append(param)
         elif ".momh_gate" in name:
-            gate_params.append(param)
+            # Match nanoVLM_main semantics:
+            # - lr_momh_gate is None: gate params stay in LM group
+            # - lr_momh_gate is set:  gate params get their own group
+            if config.lr_momh_gate is None:
+                lm_params.append(param)
+            else:
+                gate_params.append(param)
         else:
             lm_params.append(param)
 
     base_lr = config.lr
     groups = []
 
-    specs = [
+    specs: list[tuple[str, list[nn.Parameter], float | None]] = [
         ("lm", lm_params, base_lr),
         ("vision", vision_params, config.lr_vision),
         ("projector", projector_params, config.lr_projector),
-        ("momh_gate", gate_params, config.lr_momh_gate),
     ]
+    if config.lr_momh_gate is not None:
+        specs.append(("momh_gate", gate_params, config.lr_momh_gate))
 
     for group_name, params, lr in specs:
         if not params:
