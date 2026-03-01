@@ -14,6 +14,48 @@ Each entry should include:
 
 <!-- New entries go above this line -->
 
+## 2026-03-01
+
+- **Date**: 2026-03-01
+- **Type**: Retrospective
+- **General description**: Soft-gating keeps speed/VRAM wins, but exact parity still fails and recent parity-hypothesis edits regressed loss matching.
+- **Details**:
+  - Revalidated current best 100-step reference pair:
+    - output: `soft-gating-soft100-flexwarm-structonly-20260301-2`
+    - baseline `8k9vwq4u`: elapsed `440.46s`, peak `28521 MiB`
+    - torchtitan `nz6mijs6`: elapsed `378.54s`, peak `22105 MiB`
+    - parity: mean abs diff `0.0057487`, max abs diff `0.16721` at step `9`
+  - Tested three additional soft-gating hypotheses (20-step) and all regressed parity:
+    - `soft20-nowarmconsume-20260301-1`: mean `0.04177`, max `0.24875` (step `2`)
+    - `soft20-nonepassthrough-20260301-1`: mean `0.02915`, max `0.16999` (step `9`)
+    - `soft20-validitysync-20260301-1`: mean `0.023855`, max `0.14260` (step `11`)
+  - Decision:
+    - keep `soft100-flexwarm-structonly` as the control run for soft-gating;
+    - reject the above three hypotheses as known regressions;
+    - continue parity work with early-step (`1-15`) gating as primary acceptance criteria.
+
+- **Date**: 2026-03-01
+- **Type**: Retrospective
+- **General description**: Soft-gating remains blocked on exact loss parity while speed and VRAM targets stay satisfied.
+- **Details**:
+  - Reconfirmed latest valid 100-step paired soft-gating run (`soft-gating-clipfix-final2-20260228-022309`) as the decision baseline.
+  - Baseline run `3j50m01e`: elapsed `462.50s`, peak `28521 MiB`.
+  - Torchtitan run `igb9fybu`: elapsed `374.78s`, peak `22105 MiB`.
+  - Outcome against hard requirements:
+    - speed: pass (Torchtitan faster),
+    - VRAM: pass (Torchtitan lower),
+    - exact loss parity: fail (mean abs diff `0.0066478`, max abs diff `0.16272` at step `9`).
+  - Additional soft-gating diagnostics from 20-step runs:
+    - `soft-gating-soft20-revertlosswarmup-20260228-1`: mean abs diff `0.0148275`, max `0.17152`, Torchtitan peak `22105 MiB`.
+    - `soft-gating-soft20-revertwarmup-modelonly-20260228-1`: mean abs diff `0.0311175`, max `0.25444`, Torchtitan peak `29605 MiB`.
+  - Practical takeaway:
+    - model+loss compile is currently the safer path for this port;
+    - model-only compile did not improve parity and increased peak VRAM in the latest checked run.
+  - Next controlled protocol:
+    - enforce early-step parity gate on steps `1-15`,
+    - run fixed A/B matrix over workers/compile/optimizer-backend with identical data controls,
+    - keep baseline-vs-baseline comparison in every soft-gating parity report.
+
 ## 2026-02-28
 
 - **Date**: 2026-02-28

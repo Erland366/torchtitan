@@ -11,15 +11,26 @@ The paper config is set to mirror `nanoVLM_main/configs/train.paper.vanilla-fine
   - `beta2=0.999`
   - `eps=1e-8`
   - `weight_decay=0.01`
+  - nanoVLM optimizer container defaults to `implementation="foreach"` to avoid
+    accidental fused-backend drift in parity runs when implementation is not
+    explicitly pinned in config
 - LR schedule aligned with `nanoVLM_main/train.py:get_lr(...)` behavior:
   - per-update LR assignment before optimizer step
   - warmup computed as `max_steps * 0.005`
   - cosine decay to `0.1 * max_lr`
+  - manual nanoVLM LR path is selected using optimizer-group `max_lr` metadata
+    (not strict group-name matching), so scheduler step ordering remains robust
+    if group names evolve
 - Compile scope aligned with original behavior:
   - compile model blocks
   - compile loss (fuses logits->CE path and reduces peak reserved VRAM)
   - use Torchtitan native per-block compile path (`apply_compile`)
     rather than a custom nanoVLM forward-wrapper compile
+  - warm flex-attention compile paths (prefill/decode, structural/soft-gating)
+    before model block compile to stabilize first training steps
+- Vision encoder init parity:
+  - ViT patch position embedding init uses `uniform_(0, 1)` to match
+    `nanoVLM_main` constructor semantics
 - Data filtering aligned with original dataset processing:
   - `relevance_ratings`
   - `image_correspondence_ratings`
@@ -69,6 +80,13 @@ back-to-back with:
 - external `nvidia-smi` VRAM sampling
 - parsed per-step loss/tps summaries
 - JSON + Markdown output artifacts
+
+Optional benchmark overrides:
+
+- `--torchtitan-config <config_fn>`: choose a specific Torchtitan config
+  function instead of the mode default.
+- `--torchtitan-extra-args "...args..."`: append extra CLI args to the
+  Torchtitan command (useful for sections that are CLI-overridable).
 
 Example (vanilla):
 

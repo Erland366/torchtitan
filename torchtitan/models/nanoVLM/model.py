@@ -684,7 +684,7 @@ class NanoVLMModel(BaseModel):
 
         # ViT position embedding and CLS token (raw Parameters)
         patch_emb = self.vision_encoder.patch_embedding
-        nn.init.uniform_(patch_emb.position_embedding, -1.0, 1.0)
+        nn.init.uniform_(patch_emb.position_embedding, 0.0, 1.0)
         if patch_emb.cls_flag:
             nn.init.zeros_(patch_emb.cls_token)
 

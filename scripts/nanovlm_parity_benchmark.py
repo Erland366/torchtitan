@@ -191,6 +191,11 @@ def _build_baseline_config(
     run_name_prefix: str,
     wandb_entity: str,
     wandb_project: str,
+    train_num_workers: int | None = None,
+    val_num_workers: int | None = None,
+    dataloader_persistent_workers: bool | None = None,
+    stream_dataset: bool | None = None,
+    compile_enable: bool | None = None,
 ) -> None:
     with source_config_path.open("r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
@@ -210,6 +215,16 @@ def _build_baseline_config(
     train_cfg["wandb_run_name_prefix"] = run_name_prefix
     train_cfg["push_checkpoints_to_hub"] = False
     train_cfg["push_final_model_to_hub"] = False
+    if train_num_workers is not None:
+        train_cfg["train_num_workers"] = train_num_workers
+    if val_num_workers is not None:
+        train_cfg["val_num_workers"] = val_num_workers
+    if dataloader_persistent_workers is not None:
+        train_cfg["dataloader_persistent_workers"] = dataloader_persistent_workers
+    if stream_dataset is not None:
+        train_cfg["stream_dataset"] = stream_dataset
+    if compile_enable is not None:
+        train_cfg["compile"] = compile_enable
 
     with output_config_path.open("w", encoding="utf-8") as f:
         yaml.safe_dump(config, f, sort_keys=False)
@@ -274,12 +289,54 @@ def main() -> int:
         help="Optional explicit output directory for logs and summaries.",
     )
     parser.add_argument(
+        "--torchtitan-config",
+        type=str,
+        default=None,
+        help="Optional torchtitan config function name (overrides mode default).",
+    )
+    parser.add_argument(
+        "--baseline-train-num-workers",
+        type=int,
+        default=None,
+        help="Optional override for baseline train_num_workers.",
+    )
+    parser.add_argument(
+        "--baseline-val-num-workers",
+        type=int,
+        default=None,
+        help="Optional override for baseline val_num_workers.",
+    )
+    parser.add_argument(
+        "--baseline-persistent-workers",
+        choices=["true", "false"],
+        default=None,
+        help="Optional override for baseline dataloader_persistent_workers.",
+    )
+    parser.add_argument(
+        "--baseline-stream-dataset",
+        choices=["true", "false"],
+        default=None,
+        help="Optional override for baseline stream_dataset.",
+    )
+    parser.add_argument(
+        "--baseline-compile",
+        choices=["true", "false"],
+        default=None,
+        help="Optional override for baseline compile flag.",
+    )
+    parser.add_argument(
         "--max-abs-loss-diff",
         type=float,
         default=None,
         help=(
             "If set, exits non-zero when max absolute loss diff exceeds this threshold."
         ),
+    )
+    parser.add_argument(
+        "--torchtitan-extra-args",
+        type=str,
+        default="",
+        help="Additional CLI args appended to the Torchtitan command.",
     )
     args = parser.parse_args()
 
@@ -311,6 +368,8 @@ def main() -> int:
     else:
         baseline_cfg = "configs/train.paper.momh.soft-gating-b5-tttv.nopack.yaml"
         torchtitan_cfg = "nanovlm_230m_momh_soft_gating_b5_tttv_nopack"
+    if args.torchtitan_config:
+        torchtitan_cfg = args.torchtitan_config
 
     baseline_name = f"baseline-{args.mode}-{args.steps}step-{args.run_suffix}"
     torchtitan_name = f"torchtitan-{args.mode}-{args.steps}step-{args.run_suffix}"
@@ -324,6 +383,21 @@ def main() -> int:
         run_name_prefix=baseline_name,
         wandb_entity=args.wandb_entity,
         wandb_project=args.wandb_project,
+        train_num_workers=args.baseline_train_num_workers,
+        val_num_workers=args.baseline_val_num_workers,
+        dataloader_persistent_workers=(
+            None
+            if args.baseline_persistent_workers is None
+            else (args.baseline_persistent_workers == "true")
+        ),
+        stream_dataset=(
+            None
+            if args.baseline_stream_dataset is None
+            else (args.baseline_stream_dataset == "true")
+        ),
+        compile_enable=(
+            None if args.baseline_compile is None else (args.baseline_compile == "true")
+        ),
     )
 
     baseline_cmd = (
@@ -340,6 +414,8 @@ def main() -> int:
         "--metrics.log_freq 1 "
         f"--checkpoint.folder parity_{args.mode}_{args.steps}_{args.run_suffix}"
     )
+    if args.torchtitan_extra_args.strip():
+        torchtitan_cmd = f"{torchtitan_cmd} {args.torchtitan_extra_args.strip()}"
 
     env_common = {
         "WANDB_ENTITY": args.wandb_entity,

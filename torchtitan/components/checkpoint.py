@@ -632,15 +632,55 @@ class CheckpointManager(Configurable):
 
             state_dict = self.sd_adapter.from_hf(hf_state_dict)
             model = self.states[MODEL]
-            # nanoVLM soft-gating checkpoints may intentionally miss newly introduced
-            # gate params; allow those while still failing on unexpected mismatches.
-            if getattr(self.sd_adapter, "allow_partial_hf_load", False):
-                missing, unexpected = model.load_state_dict(state_dict, strict=False)
-                non_gate_missing = [k for k in missing if "momh_gate" not in k]
-                if non_gate_missing:
+            model.load_state_dict(state_dict)
+
+            if getattr(self.sd_adapter, "validate_hf_load_keys", False):
+                def _normalize_key(key: str) -> str:
+                    return key.replace("._orig_mod.", ".")
+
+                drop_prefixes = tuple(
+                    getattr(self.sd_adapter, "hf_load_drop_prefixes", ())
+                )
+                drop_exact = set(getattr(self.sd_adapter, "hf_load_drop_exact", ()))
+                allowed_missing_prefixes = tuple(
+                    getattr(self.sd_adapter, "hf_load_allowed_missing_prefixes", ())
+                )
+                allowed_missing_substrings = tuple(
+                    getattr(self.sd_adapter, "hf_load_allowed_missing_substrings", ())
+                )
+
+                def _should_drop(key: str) -> bool:
+                    return key in drop_exact or any(
+                        key.startswith(prefix) for prefix in drop_prefixes
+                    )
+
+                def _is_allowed_missing(key: str) -> bool:
+                    return any(
+                        key.startswith(prefix) for prefix in allowed_missing_prefixes
+                    ) or any(substr in key for substr in allowed_missing_substrings)
+
+                expected_raw = set(model.state_dict().keys())
+                expected = {
+                    _normalize_key(key)
+                    for key in expected_raw
+                    if not _should_drop(_normalize_key(key))
+                }
+                loaded = {
+                    _normalize_key(key)
+                    for key in state_dict.keys()
+                    if not _should_drop(_normalize_key(key))
+                }
+
+                missing = sorted(expected - loaded)
+                unexpected = sorted(loaded - expected)
+                disallowed_missing = [
+                    key for key in missing if not _is_allowed_missing(key)
+                ]
+
+                if disallowed_missing:
                     raise RuntimeError(
-                        "Missing non-gate keys while loading HF checkpoint: "
-                        f"{non_gate_missing[:10]}"
+                        "Missing non-allowlisted keys while loading HF checkpoint: "
+                        f"{disallowed_missing[:10]}"
                     )
                 if unexpected:
                     raise RuntimeError(
@@ -649,11 +689,9 @@ class CheckpointManager(Configurable):
                     )
                 if missing:
                     logger.info(
-                        f"HF checkpoint loaded with {len(missing)} missing gate keys "
-                        "(expected for soft-gating injection)."
+                        "HF checkpoint loaded with %d allowlisted missing keys.",
+                        len(missing),
                     )
-            else:
-                model.load_state_dict(state_dict)
         else:
             dcp.load(state_dict, checkpoint_id=checkpoint_id)
 

@@ -27,6 +27,16 @@ class NanoVLMStateDictAdapter(BaseStateDictAdapter):
         self.model_config = model_config
         self.hf_assets_path = hf_assets_path
         self.fqn_to_index_mapping = None
+        # Enforce explicit HF-load coverage checks in CheckpointManager.
+        # We intentionally allow:
+        # - vision_encoder.layers.* (ModuleDict alias of blocks.*)
+        # - rotary_embd.inv_freq (recomputed buffer)
+        # - momh_gate params (soft-gating injection from vanilla checkpoints)
+        self.validate_hf_load_keys = True
+        self.hf_load_drop_prefixes = ("vision_encoder.layers.",)
+        self.hf_load_drop_exact = ("rotary_embd.inv_freq",)
+        self.hf_load_allowed_missing_prefixes = ()
+        self.hf_load_allowed_missing_substrings = ("momh_gate",)
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         """Convert torchtitan nanoVLM state dict to original nanoVLM format.

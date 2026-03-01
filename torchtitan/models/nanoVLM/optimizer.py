@@ -11,6 +11,7 @@ so per-group ratios are preserved throughout training.
 """
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch.nn as nn
 
@@ -30,6 +31,9 @@ class NanoVLMOptimizersContainer(OptimizersContainer):
 
         lr_momh_gate: float | None = None
         """Learning rate for MoMH gate parameters. None = use base lr."""
+
+        implementation: Literal["for-loop", "foreach", "fused"] = "foreach"
+        """Default to foreach for nanoVLM parity with nanoVLM_main AdamW behavior."""
 
     def __init__(self, config: Config, *, model_parts: list[nn.Module]) -> None:
         optimizer_cls = self._resolve_optimizer_cls(config.name)

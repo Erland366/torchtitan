@@ -25,6 +25,100 @@ flex_attention_compiled_dynamic = torch.compile(flex_attention, dynamic=True)
 torch._dynamo.config.cache_size_limit = 1000
 
 
+def warmup_flex_attention_compile(
+    *,
+    device: torch.device,
+    n_heads: int,
+    head_dim: int,
+    include_soft_gating: bool,
+) -> None:
+    """Compile flex_attention call paths ahead of model block compilation.
+
+    This warms:
+    - prefill block-mask path (dynamic=False)
+    - decode block-mask path (dynamic=True)
+    - optional soft-gating score_mod variants for both paths
+    """
+    if device.type != "cuda":
+        return
+
+    # Match training dtype (bf16 on A100/Hopper) to avoid compiling only fp32 paths.
+    dtype = torch.bfloat16
+    B = 1
+    q_len = 32
+    kv_len = 32
+
+    q_prefill = torch.randn(B, n_heads, q_len, head_dim, device=device, dtype=dtype)
+    k_full = torch.randn(B, n_heads, kv_len, head_dim, device=device, dtype=dtype)
+    v_full = torch.randn(B, n_heads, kv_len, head_dim, device=device, dtype=dtype)
+    q_decode = torch.randn(B, n_heads, 1, head_dim, device=device, dtype=dtype)
+
+    # Minimal but valid structural metadata for MoMH paths.
+    is_vision = torch.zeros(B, kv_len, dtype=torch.bool, device=device)
+    is_vision[:, : min(8, kv_len)] = True
+    attention_mask = torch.ones(B, kv_len, dtype=torch.bool, device=device)
+
+    prefill_mask = create_base_structural_block_mask(
+        q_len=q_len,
+        kv_len=kv_len,
+        is_vision=is_vision,
+        attention_mask=attention_mask,
+        device=str(device),
+    )
+    decode_mask = create_base_structural_block_mask(
+        q_len=1,
+        kv_len=kv_len,
+        is_vision=is_vision,
+        attention_mask=attention_mask,
+        device=str(device),
+    )
+
+    # Structural-only compile paths.
+    _ = flex_attention_compiled(q_prefill, k_full, v_full, block_mask=prefill_mask)
+    _ = flex_attention_compiled_dynamic(
+        q_decode, k_full, v_full, block_mask=decode_mask
+    )
+
+    if include_soft_gating:
+        # Keep gate tensors local to warmup to avoid mutating model params.
+        # Gate params are stored as fp32 in training; compile score_mod with
+        # fp32 gates to avoid dtype-specializing warmup to a lower-precision
+        # path that does not match runtime numerics.
+        momh_gate = torch.zeros(n_heads, 4, device=device, dtype=torch.float32)
+
+        prefill_score_mod = generate_soft_gating_score_mod(
+            momh_gate=momh_gate,
+            is_vision=is_vision,
+            q_offset=0,
+            active_pairs="tt_tv",
+        )
+        decode_score_mod = generate_soft_gating_score_mod(
+            momh_gate=momh_gate,
+            is_vision=is_vision,
+            q_offset=kv_len - 1,
+            active_pairs="tt_tv",
+        )
+
+        _ = flex_attention_compiled(
+            q_prefill,
+            k_full,
+            v_full,
+            score_mod=prefill_score_mod,
+            block_mask=prefill_mask,
+        )
+        _ = flex_attention_compiled_dynamic(
+            q_decode,
+            k_full,
+            v_full,
+            score_mod=decode_score_mod,
+            block_mask=decode_mask,
+        )
+
+    # Prevent compiler warmup tensors from polluting peak memory tracking.
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+
+
 def generate_momh_mask_mod_from_modality(
     n_q_heads: int,
     *,
@@ -274,7 +368,11 @@ def create_causal_block_mask(
 
 
 def generate_soft_gating_score_mod(
-    *, momh_gate, is_vision, q_offset=0, active_pairs="all"
+    *,
+    momh_gate,
+    is_vision,
+    q_offset=0,
+    active_pairs="all",
 ):
     """
     Generate a score_mod that adds learnable per-head modality bias.

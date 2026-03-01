@@ -26,6 +26,8 @@ from torchtitan.models.llama3.parallelize import (
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 from torchtitan.tools.logging import logger
 
+from .attention import warmup_flex_attention_compile
+
 
 def parallelize_nanovlm(
     model: nn.Module,
@@ -63,11 +65,35 @@ def parallelize_nanovlm(
         )
         apply_ac(model.vision_encoder, ac_config)
 
-    # 2. Use the native Torchtitan per-block compile path.
+    # 2. Compile flex-attention call paths before model block compile.
+    cfg = getattr(model, "config", None)
+    if (
+        torch.cuda.is_available()
+        and cfg is not None
+        and bool(getattr(cfg, "momh_enabled", False))
+    ):
+        n_heads = int(cfg.lm_n_heads)
+        hidden_dim = int(cfg.lm_hidden_dim)
+        if n_heads <= 0 or hidden_dim <= 0 or hidden_dim % n_heads != 0:
+            raise ValueError(
+                "Invalid nanoVLM head config for flex-attention warmup: "
+                f"n_heads={n_heads}, hidden_dim={hidden_dim}"
+            )
+        warmup_flex_attention_compile(
+            device=torch.device("cuda", torch.cuda.current_device()),
+            n_heads=n_heads,
+            head_dim=hidden_dim // n_heads,
+            # Warm structural flex-attention kernels ahead of training.
+            # Keep score_mod warmup disabled to avoid baking synthetic gate
+            # values into warmup-specialized compile paths.
+            include_soft_gating=False,
+        )
+
+    # 3. Use the native Torchtitan per-block compile path.
     if model_compile_enabled:
         apply_compile(model, compile_config)
 
-    # 3. FSDP
+    # 4. FSDP
     if parallel_dims.fsdp_enabled:
         names = (
             ["dp_replicate", "fsdp"]

@@ -689,17 +689,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     def _maybe_apply_nanovlm_manual_lr(self) -> float | None:
         """Apply nanoVLM per-param-group LR schedule when nanoVLM groups are present."""
         named_groups: list[dict[str, Any]] = []
+        has_nanovlm_lr_groups = False
         for optimizer in self.optimizers:
             for group in optimizer.param_groups:
                 if "name" in group:
                     named_groups.append(group)
+                if "max_lr" in group:
+                    has_nanovlm_lr_groups = True
 
-        if not named_groups:
-            return None
-
-        valid_names = {"lm", "vision", "projector", "momh_gate"}
-        group_names = {str(group.get("name")) for group in named_groups}
-        if not group_names.issubset(valid_names):
+        # For nanoVLM we key off "max_lr" (set by NanoVLMOptimizersContainer)
+        # instead of strict group-name checks, so schedule order remains robust
+        # if group naming evolves.
+        if not named_groups or not has_nanovlm_lr_groups:
             return None
 
         max_steps = self.config.training.steps

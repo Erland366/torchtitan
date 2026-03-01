@@ -23,7 +23,6 @@ from PIL import Image
 from torch.utils.data import IterableDataset, get_worker_info
 from torchvision.transforms.functional import resize, InterpolationMode
 
-from datasets.distributed import split_dataset_by_node
 from torch.distributed.checkpoint.stateful import Stateful
 
 from torchtitan.components.dataloader import ParallelAwareDataloader
@@ -296,30 +295,43 @@ class VQADataset:
         }
 
     def _get_messages(self, item, splitted_image_counts):
-        rating_thresholds = (
-            ("relevance_ratings", self.relevance_min_rating),
-            ("image_correspondence_ratings", self.image_correspondence_min_rating),
-            ("visual_dependency_ratings", self.visual_dependency_min_rating),
-            ("formatting_ratings", self.formatting_min_rating),
-        )
         messages = []
         for index, text in enumerate(item["texts"]):
-            skip_message = False
-            for rating_key, min_rating in rating_thresholds:
-                ratings = item.get(rating_key)
-                if ratings is None:
+            try:
+                if (
+                    item.get("relevance_ratings") is not None
+                    and item["relevance_ratings"][index] is not None
+                    and item["relevance_ratings"][index] < self.relevance_min_rating
+                ):
                     continue
-                if index >= len(ratings):
-                    raise ValueError(
-                        f"Invalid sample: '{rating_key}' has length {len(ratings)} "
-                        f"but 'texts' index {index} was requested."
-                    )
-                rating_value = ratings[index]
-                if rating_value is not None and rating_value < min_rating:
-                    skip_message = True
-                    break
-            if skip_message:
-                continue
+                if (
+                    item.get("image_correspondence_ratings") is not None
+                    and item["image_correspondence_ratings"][index] is not None
+                    and item["image_correspondence_ratings"][index]
+                    < self.image_correspondence_min_rating
+                ):
+                    continue
+                if (
+                    item.get("visual_dependency_ratings") is not None
+                    and item["visual_dependency_ratings"][index] is not None
+                    and item["visual_dependency_ratings"][index]
+                    < self.visual_dependency_min_rating
+                ):
+                    continue
+                if (
+                    item.get("formatting_ratings") is not None
+                    and item["formatting_ratings"][index] is not None
+                    and item["formatting_ratings"][index]
+                    < self.formatting_min_rating
+                ):
+                    continue
+            except Exception as exc:
+                logging.warning(
+                    "Error processing ratings at index %s for sample: %s",
+                    index,
+                    exc,
+                )
+
             messages.append({"role": "user", "content": text["user"]})
             messages.append({"role": "assistant", "content": text["assistant"]})
 
@@ -636,38 +648,80 @@ class NanoVLMIterableDataset(IterableDataset, Stateful):
         dp_world_size: int,
     ):
         super().__init__()
-        from datasets import load_dataset
+        from datasets import (
+            concatenate_datasets,
+            get_dataset_config_names,
+            interleave_datasets,
+            load_dataset,
+            load_from_disk,
+        )
 
         self._streaming = streaming
         self._sample_idx = 0
-        dataset_config = dataset_name[0]
-        if dataset_config in ("default", "", None):
-            dataset_config = None
 
-        if streaming:
-            hf_dataset = load_dataset(
+        dataset_names_to_load = list(dataset_name) if dataset_name else ["default"]
+        if "shards" in dataset_names_to_load:
+            total_shards = 56
+            dataset_names_to_load = [
+                f"{dataset_path}/shard_{idx}" for idx in range(total_shards)
+            ]
+        if "_all_" in dataset_names_to_load:
+            dataset_names_to_load = get_dataset_config_names(dataset_path)
+
+        def _load_train_split(config_name: str):
+            if "shard_" in config_name:
+                return load_from_disk(config_name)
+            hf_config_name = None if config_name in ("default", "", None) else config_name
+            return load_dataset(
                 dataset_path,
-                name=dataset_config,
+                name=hf_config_name,
                 split="train",
-                streaming=True,
+                streaming=streaming,
                 on_bad_files="warn",
             )
-            hf_dataset = split_dataset_by_node(
-                hf_dataset, rank=dp_rank, world_size=dp_world_size
-            )
-            self._hf_data = hf_dataset
-        else:
-            hf_dataset = load_dataset(
-                dataset_path,
-                name=dataset_config,
-                split="train",
-                on_bad_files="warn",
-            )
-            if dp_world_size > 1:
-                hf_dataset = hf_dataset.shard(
-                    num_shards=dp_world_size, index=dp_rank
+
+        loaded_datasets = []
+        for config_name in dataset_names_to_load:
+            try:
+                ds = _load_train_split(config_name)
+                if streaming:
+                    next(iter(ds))
+                else:
+                    ds[0]
+                loaded_datasets.append(ds)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to load dataset config '%s' from '%s': %s",
+                    config_name,
+                    dataset_path,
+                    exc,
                 )
-            self._hf_data = None
+
+        if not loaded_datasets:
+            raise ValueError(
+                "No valid train datasets were loaded. Check dataset path and config names."
+            )
+
+        if len(loaded_datasets) == 1:
+            hf_dataset = loaded_datasets[0]
+        elif streaming:
+            hf_dataset = interleave_datasets(
+                loaded_datasets,
+                stopping_strategy="all_exhausted",
+            )
+        else:
+            hf_dataset = concatenate_datasets(loaded_datasets)
+
+        if not streaming:
+            hf_dataset = hf_dataset.shuffle(seed=0)
+
+        if dp_world_size > 1:
+            hf_dataset = hf_dataset.shard(
+                num_shards=dp_world_size,
+                index=dp_rank,
+            )
+
+        self._hf_data = hf_dataset if streaming else None
 
         self.vqa_dataset = VQADataset(
             hf_dataset,
