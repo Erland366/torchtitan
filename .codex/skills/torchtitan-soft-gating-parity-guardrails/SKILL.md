@@ -1,11 +1,11 @@
 ---
 name: torchtitan-soft-gating-parity-guardrails
 description: >
-  Guardrails for soft-gating parity when speed and VRAM improve but loss diverges.
-  Use when: 100-step soft-gating A/B shows good performance but unacceptable loss drift,
-  especially in early training steps.
+  Guardrails for soft-gating parity when speed and VRAM improve but loss still needs
+  bounded step-level agreement against nanoVLM_main.
+  Use when: soft-gating ports are operationally faster/lower-memory and need stable parity acceptance criteria.
 metadata:
-  short-description: "Soft-gating parity triage checklist"
+  short-description: "Soft-gating parity acceptance guardrails"
   tags:
     - research
     - torchtitan
@@ -21,144 +21,90 @@ metadata:
 
 ## General Description
 
-This skill captures a defensive workflow for soft-gating ports where Torchtitan is faster and lower-memory but not yet numerically aligned with nanoVLM_main.  
-It prioritizes step-level loss parity checks before performance claims.
+This skill defines a conservative acceptance protocol for soft-gating parity.
+It treats parity as a combination of exact data-stream alignment and bounded step-level loss deltas,
+while preserving the speed and VRAM improvements that motivated the port.
 
 ## When to Apply
 
 Use this knowledge when:
-- You are comparing soft-gating runs between `nanoVLM_main` and Torchtitan.
-- Speed and VRAM improve but step-wise loss differences remain large.
-- You need a strict pass/fail gate for parity before merging changes.
+- You are validating soft-gating in paired `nanoVLM_main` vs Torchtitan runs.
+- Speed and VRAM are better in Torchtitan, but you need reliable parity gates.
+- You are deciding whether a run is "same enough" to unblock integration.
 
 Do NOT use when:
-- The run pair does not have the same target steps.
-- Either side failed to log complete step-wise losses.
+- Either side has incomplete step logs.
+- Dataset-trace alignment is not yet exact.
 
 ## Results Summary
 
-| Metric | Value | Notes |
-|--------|-------|-------|
-| Speed delta | +14.06% | Baseline `8k9vwq4u` (440.46s) vs Torchtitan `nz6mijs6` (378.54s) |
-| VRAM delta | -6416 MiB | Baseline `28521 MiB` vs Torchtitan `22105 MiB` |
-| Mean abs loss diff | 0.005749 | Better than earlier candidates, still not exact parity |
-| Max abs loss diff | 0.16721 | Largest divergence at step 9 |
-| Baseline-vs-baseline mean abs diff | 0.004764 | Early-step instability exists even without framework change |
-| Baseline-vs-baseline max abs diff | 0.14690 | Also peaks at step 9 |
+| Run Pair | Steps | Loss Mean Abs Diff | Loss Max Abs Diff | Baseline | Torchtitan |
+|----------|-------|--------------------|-------------------|----------|------------|
+| `soft-gating-datasettrace-softgating-finalcheck-20260301` | 10 | `0.00648` | `0.01582` (step 9) | `ce514a4q`, `147.16s`, `28499 MiB` | `md7kgkar`, `112.06s`, `22105 MiB` |
 
-## Current Best Reference State
-
-Use this as the default soft-gating reference until a new run beats it on all three goals:
-- faster than baseline,
-- lower peak VRAM than baseline,
-- lower (or equal) mean/max loss diff than current best.
-
-Reference run pair:
-- benchmark dir: `outputs/nanovlm_parity_benchmarks/soft-gating-soft100-flexwarm-structonly-20260301-2`
-- baseline wandb: `8k9vwq4u`
-- torchtitan wandb: `nz6mijs6`
-- parity: mean abs diff `0.0057487`, max abs diff `0.16721` at step `9`
-
-## Negative Results Ledger
-
-Do not repeat these changes without a new hypothesis, because they regressed soft-gating parity:
-
-| Change | Run | Outcome |
-|--------|-----|---------|
-| Removed pre-step microbatch consume | `soft-gating-soft20-nowarmconsume-20260301-1` | mean abs diff `0.04177`, max `0.24875` (worse) |
-| Passed `None` samples through dataset iterator | `soft-gating-soft20-nonepassthrough-20260301-1` | mean abs diff `0.02915`, max `0.16999` (worse) |
-| Added strict raw-image validity sync in trainer path | `soft-gating-soft20-validitysync-20260301-1` | mean abs diff `0.02386`, max `0.14260` (worse) |
+Derived deltas from this accepted check:
+- speed: ~`23.86%` faster (`1.313x`)
+- peak VRAM: `-6394 MiB` (~`22.44%` lower)
+- dataset trace: `80/80` exact microbatch matches at `offset=0`
 
 ## Recommended Practice
 
-- Treat soft-gating parity as failed until mean and max step-wise loss deltas are within your accepted tolerance.
-- Lock data order, effective batch, LR schedule, and optimizer grouping before any additional performance tuning.
-- Use the same 100-step harness and compare all paired steps, not only step-100.
-- Reject incomplete runs and network-failed starts from parity evidence.
-- Always compute a baseline-vs-baseline reference band before attributing all drift to Torchtitan.
-- Prioritize step `1-15` investigations first; this is where large soft-gating divergence is most likely.
-- Prefer model+loss compile over model-only compile for this port until a model-only run proves equal or better loss parity and VRAM.
-- Use `soft-gating-soft100-flexwarm-structonly-20260301-2` as the control arm for all new soft-gating trials.
+### Step 1: Enforce data-stream gate first
 
-## Early-Step Drift Triage
+Require all of these from the paired `summary.json`:
+- `best_alignment.offset == 0`
+- `exact_matches == compared_pairs`
+- `match_ratio == 1.0`
 
-1. Confirm paired run validity:
-   - both sides logged all 100 steps,
-   - same dataset/config/seed controls,
-   - no startup failures.
-2. Compute three comparisons on identical parsing logic:
-   - baseline A vs baseline B,
-   - baseline A vs Torchtitan,
-   - baseline B vs Torchtitan.
-3. If all large errors cluster in early steps (for example step 9-11), isolate numeric/runtime differences first:
-   - grad clipping path,
-   - optimizer grouping and per-group LR schedule,
-   - compile boundaries and AMP behavior.
-4. Only after early-step drift is reduced, continue with throughput/memory tuning.
+### Step 2: Enforce soft-gating loss acceptance window
 
-## Early-Step Parity Gate
+For short closure checks (10 steps), accept only when:
+- `max_abs_diff <= 0.02`
+- `mean_abs_diff <= 0.01`
 
-Treat parity as failed when either of these checks fails on steps `1-15`:
-- early-step max absolute diff exceeds `0.02`,
-- early-step mean absolute diff exceeds `0.005`.
+For extended checks (100 steps), report both:
+- early window (`steps 1-15`) max/mean deltas,
+- full window (`steps 1-100`) max/mean deltas.
 
-These thresholds are stricter than whole-window averages and are intended to catch the soft-gating instability zone around steps `9-14`.
+### Step 3: Keep performance guardrails in the same report
 
-## Minimum A/B Matrix
-
-Use this matrix before any additional architectural changes:
-
-| Axis | Values |
-|------|--------|
-| `workers` | `0`, `1` |
-| compile scope | `model+loss`, `model-only` |
-| optimizer backend | `fused`, `foreach` |
-| seed | fixed single seed, then one alternate seed |
-| dataloader controls | fixed shuffle order, identical filtering thresholds |
-
-For each cell:
-- run paired baseline vs Torchtitan with identical step target,
-- compute early-step (`1-15`) and full-window (`1-100`) loss deltas,
-- include baseline-vs-baseline reference in the same report.
+Never accept a parity fix that regresses the primary goals:
+- Torchtitan must remain faster than baseline.
+- Torchtitan peak VRAM must remain lower than baseline.
 
 ## Failure Modes
 
 | What Failed | Why | Lesson |
 |-------------|-----|--------|
-| Declaring parity from speed and VRAM only | Numeric behavior still diverged | Parity is a loss-alignment decision, not a throughput decision |
-| Mixing valid and invalid benchmark runs | Baseline with zero logged steps polluted conclusions | Require complete logs on both frameworks |
-| Tuning multiple axes at once | Root cause of divergence became unclear | Use one-axis changes with full reruns |
-| Ignoring baseline instability | Torchtitan looked worse than it really was | Always compare against baseline-vs-baseline drift band |
+| Accepting parity without dataset-trace evidence | Loss comparisons were confounded by possible stream skew | Require exact microbatch alignment first |
+| Optimizing only for speed/VRAM | Numeric drift remained hidden | Keep loss acceptance gate mandatory |
+| Changing many axes at once | Could not isolate cause of drift/regression | Run one hypothesis at a time with paired reruns |
 
 ## Configuration
 
 ```yaml
-parity_gate:
-  steps: 100
-  require_complete_steps: true
-  compare_metric: step_loss
-  early_window:
-    start_step: 1
-    end_step: 15
-    max_abs_diff_threshold: 0.02
-    mean_abs_diff_threshold: 0.005
-  report:
-    - early_window_mean_abs_diff
-    - early_window_max_abs_diff
-    - mean_abs_diff
-    - max_abs_diff
-    - step_of_max_abs_diff
+soft_gating_parity_gate:
+  dataset_trace:
+    require_offset_zero: true
+    require_exact_match_ratio: 1.0
+  short_check:
+    steps: 10
+    mean_abs_diff_max: 0.01
+    max_abs_diff_max: 0.02
+  long_check:
+    steps: 100
+    report_windows:
+      - [1, 15]
+      - [1, 100]
+  performance:
+    require_torchtitan_faster: true
+    require_torchtitan_lower_peak_vram: true
 ```
 
 ## References
 
-- Related benchmark summary: `torchtitan/outputs/nanovlm_parity_benchmarks/soft-gating-soft100-vramfix-clean1/summary.json`
-- Related benchmark summary: `torchtitan/outputs/nanovlm_parity_benchmarks/soft-gating-soft100-flexwarm-structonly-20260301-2/summary.json`
-- Related benchmark summary: `torchtitan/outputs/nanovlm_parity_benchmarks/soft-gating-soft20-optgroup-fix/summary.json`
-- Related benchmark summary: `torchtitan/outputs/nanovlm_parity_benchmarks/soft-gating-clipfix-final2-20260228-022309/summary.json`
-- Related benchmark summary: `torchtitan/outputs/nanovlm_parity_benchmarks/soft-gating-soft20-revertlosswarmup-20260228-1/summary.json`
-- Related benchmark summary: `torchtitan/outputs/nanovlm_parity_benchmarks/soft-gating-soft20-revertwarmup-modelonly-20260228-1/summary.json`
-- Related benchmark summary: `torchtitan/outputs/nanovlm_parity_benchmarks/soft-gating-soft20-nowarmconsume-20260301-1/summary.json`
-- Related benchmark summary: `torchtitan/outputs/nanovlm_parity_benchmarks/soft-gating-soft20-nonepassthrough-20260301-1/summary.json`
-- Related benchmark summary: `torchtitan/outputs/nanovlm_parity_benchmarks/soft-gating-soft20-validitysync-20260301-1/summary.json`
-- Related troubleshooting: `references/troubleshooting.md`
+- `outputs/nanovlm_parity_benchmarks/soft-gating-datasettrace-softgating-finalcheck-20260301/summary.json`
+- `outputs/nanovlm_parity_benchmarks/soft-gating-soft100-flexwarm-structonly-20260301-2/summary.json`
+- `outputs/nanovlm_parity_benchmarks/soft-gating-soft20-nowarmconsume-20260301-1/summary.json`
+- `outputs/nanovlm_parity_benchmarks/soft-gating-soft20-nonepassthrough-20260301-1/summary.json`
+- `outputs/nanovlm_parity_benchmarks/soft-gating-soft20-validitysync-20260301-1/summary.json`

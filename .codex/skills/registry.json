@@ -36,6 +36,10 @@
       "type": "result",
       "description": "Keep shared TorchTitan runtime upstream-first and move model quirks into adapters/hooks"
     },
+    "torchtitan-dataset-trace-parity-gate": {
+      "type": "result",
+      "description": "Require exact microbatch-stream alignment before interpreting loss parity deltas"
+    },
     "vlm-loss-parity-triangulation": {
       "type": "result",
       "description": "Protocol to isolate loss mismatch after speed/VRAM goals are already satisfied"

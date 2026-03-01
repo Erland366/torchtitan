@@ -18,6 +18,34 @@ Each entry should include:
 
 - **Date**: 2026-03-01
 - **Type**: Retrospective
+- **General description**: Final parity closure check passed practical loss parity with exact dataset-stream alignment while preserving TorchTitan speed and VRAM gains.
+- **Details**:
+  - Final paired dataset-trace checks used:
+    - `vanilla-datasettrace-vanilla-fixedwarmup-20260301`
+    - `soft-gating-datasettrace-softgating-finalcheck-20260301`
+  - Vanilla final pair:
+    - baseline `pcks21h8`: elapsed `141.36s`, peak `26169 MiB`
+    - torchtitan `8q1766hh`: elapsed `117.37s`, peak `20001 MiB`
+    - loss diff: mean `0.00137`, max `0.00362` (step `2`)
+  - Soft-gating final pair:
+    - baseline `ce514a4q`: elapsed `147.16s`, peak `28499 MiB`
+    - torchtitan `md7kgkar`: elapsed `112.06s`, peak `22105 MiB`
+    - loss diff: mean `0.00648`, max `0.01582` (step `9`)
+  - Dataset stream verification (both modes):
+    - best alignment offset `0`
+    - exact microbatch matches `80/80`
+    - match ratio `1.0`
+  - Primary technical fixes that enabled closure:
+    - preserve baseline startup warmup-discard behavior in Torchtitan parity path;
+    - align soft-gating warmup semantics for short parity horizons;
+    - keep TorchTitan native compile path (no baseline-style regional compile fork).
+  - Outcome against hard goals:
+    - Torchtitan faster: pass
+    - Torchtitan lower VRAM: pass
+    - loss parity (practical same, paired-step bounded deltas): pass
+
+- **Date**: 2026-03-01
+- **Type**: Retrospective
 - **General description**: Upstream-first runtime alignment completed; speed and VRAM targets passed, exact loss parity still open.
 - **Details**:
   - Reverted shared TorchTitan runtime behavior toward upstream in `trainer.py`, `checkpoint.py`, and `metrics.py`.
