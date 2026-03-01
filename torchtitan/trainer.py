@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import dataclasses
+import hashlib
 import json
 import os
 import time
@@ -52,6 +53,67 @@ from torchtitan.tools.profiling import (
     maybe_enable_profiling,
     ProfilingConfig,
 )
+
+PARITY_TRACE_PATH_ENV = "NANOVLM_PARITY_TRACE_PATH"
+PARITY_TRACE_MAX_UPDATES_ENV = "NANOVLM_PARITY_TRACE_MAX_UPDATES"
+
+
+def _flatten_images_for_parity_trace(images: Any) -> torch.Tensor:
+    if isinstance(images, torch.Tensor):
+        return images
+    if not isinstance(images, list):
+        return torch.zeros(0, dtype=torch.float32)
+
+    flat_images: list[torch.Tensor] = []
+    for sample_images in images:
+        if isinstance(sample_images, list):
+            for image in sample_images:
+                if isinstance(image, torch.Tensor):
+                    flat_images.append(image)
+        elif isinstance(sample_images, torch.Tensor):
+            flat_images.append(sample_images)
+
+    if not flat_images:
+        return torch.zeros(0, dtype=torch.float32)
+    if flat_images[0].ndim == 4:
+        return torch.cat(flat_images, dim=0)
+    return torch.stack(flat_images, dim=0)
+
+
+def _tensor_trace_summary(tensor: torch.Tensor | None) -> dict[str, Any]:
+    if tensor is None:
+        return {
+            "shape": [],
+            "dtype": "none",
+            "numel": 0,
+            "hash": "",
+            "sum": 0.0,
+        }
+
+    tensor_cpu = tensor.detach().contiguous()
+    if tensor_cpu.device.type != "cpu":
+        tensor_cpu = tensor_cpu.cpu()
+
+    hash_value = hashlib.sha1(tensor_cpu.numpy().tobytes()).hexdigest()
+    if tensor_cpu.numel() == 0:
+        sum_value = 0.0
+    else:
+        sum_value = float(tensor_cpu.to(torch.float64).sum().item())
+
+    return {
+        "shape": list(tensor_cpu.shape),
+        "dtype": str(tensor_cpu.dtype),
+        "numel": int(tensor_cpu.numel()),
+        "hash": hash_value,
+        "sum": sum_value,
+    }
+
+
+def _max_trace_updates() -> int | None:
+    raw_value = os.getenv(PARITY_TRACE_MAX_UPDATES_ENV, "").strip()
+    if not raw_value:
+        return None
+    return int(raw_value)
 
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
@@ -551,6 +613,43 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             # Tensors stay on CPU; moved to GPU per-microbatch during training
             yield input_dict, labels
 
+    def _maybe_trace_dataset_batch(
+        self,
+        *,
+        update_step: int,
+        microbatch_idx: int,
+        input_dict: dict[str, torch.Tensor],
+        labels: torch.Tensor,
+        event: str = "train_microbatch",
+    ) -> None:
+        trace_path = os.getenv(PARITY_TRACE_PATH_ENV, "").strip()
+        if not trace_path:
+            return
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+
+        max_updates = _max_trace_updates()
+        if max_updates is not None and update_step > max_updates:
+            return
+
+        images = input_dict.get("images")
+        images_tensor = _flatten_images_for_parity_trace(images)
+        row = {
+            "framework": "torchtitan",
+            "event": event,
+            "update_step": int(update_step),
+            "microbatch_idx": int(microbatch_idx),
+            "grad_accum_steps": int(self.gradient_accumulation_steps),
+            "input_ids": _tensor_trace_summary(input_dict.get("input")),
+            "labels": _tensor_trace_summary(labels),
+            "attention_mask": _tensor_trace_summary(input_dict.get("attention_mask")),
+            "images": _tensor_trace_summary(images_tensor),
+            "valid_tokens": int((labels != IGNORE_INDEX).sum().item()),
+        }
+
+        with open(trace_path, "a", encoding="utf-8") as trace_file:
+            trace_file.write(json.dumps(row) + "\n")
+
     def post_dataloading_process(
         self, input_dict: dict[str, torch.Tensor], labels: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
@@ -717,7 +816,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []
-        for input_dict, labels in microbatches:
+        for microbatch_idx, (input_dict, labels) in enumerate(microbatches, start=1):
+            self._maybe_trace_dataset_batch(
+                update_step=self.step,
+                microbatch_idx=microbatch_idx,
+                input_dict=input_dict,
+                labels=labels,
+            )
             # Move tensors to GPU
             for k, v in input_dict.items():
                 if isinstance(v, torch.Tensor):
@@ -809,7 +914,26 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 base_folder=config.dump_folder,
             ) as memory_profiler,
         ):
-            data_iterator = self.batch_generator(self.dataloader)
+            if (
+                self.step == 0
+                and self.config.model_spec is not None
+                and self.config.model_spec.name == "nanoVLM"
+            ):
+                # nanoVLM_main warms up workers by consuming one train batch before
+                # entering the optimization loop. Mirror that behavior for parity.
+                raw_data_iterator = iter(self.dataloader)
+                discarded_input_dict, discarded_labels = next(raw_data_iterator)
+                self._maybe_trace_dataset_batch(
+                    update_step=0,
+                    microbatch_idx=0,
+                    input_dict=discarded_input_dict,
+                    labels=discarded_labels,
+                    event="warmup_discard",
+                )
+                logger.info("Discarded one startup microbatch to match nanoVLM_main warmup.")
+                data_iterator = self.batch_generator(raw_data_iterator)
+            else:
+                data_iterator = self.batch_generator(self.dataloader)
             while self.should_continue_training():
                 self.step += 1
                 self.gc_handler.run(self.step)

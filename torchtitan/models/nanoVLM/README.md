@@ -21,6 +21,8 @@ The paper config is set to mirror `nanoVLM_main/configs/train.paper.vanilla-fine
   - manual nanoVLM LR path is selected using optimizer-group `max_lr` metadata
     (not strict group-name matching), so scheduler step ordering remains robust
     if group names evolve
+  - soft-gating paper config uses `warmup_steps=10` for the 2000-step recipe to
+    match `nanoVLM_main` warmup ratio
 - Compile scope aligned with original behavior:
   - compile model blocks
   - compile loss (fuses logits->CE path and reduces peak reserved VRAM)
@@ -46,6 +48,10 @@ The paper config is set to mirror `nanoVLM_main/configs/train.paper.vanilla-fine
   - batch-level `VQACollator` execution (not per-sample pre-collation)
   - preserves the same long-sample filtering behavior as `nanoVLM_main`
     and keeps token/image stream order in sync
+- Startup dataloader warmup aligned:
+  - Torchtitan discards one initial nanoVLM microbatch before optimization to
+    mirror `nanoVLM_main` worker warmup behavior
+  - avoids one-microbatch stream skew that previously caused loss drift
 - Packing queue sizing aligned:
   - `packing_num_sequences` defaults to `local_batch_size * 4` to mirror
     `nanoVLM_main/ConstantLengthDataset(num_of_sequences=batch_size * 4)`
@@ -87,6 +93,13 @@ Optional benchmark overrides:
   function instead of the mode default.
 - `--torchtitan-extra-args "...args..."`: append extra CLI args to the
   Torchtitan command (useful for sections that are CLI-overridable).
+
+Benchmark warmup behavior:
+
+- By default, the benchmark auto-sets Torchtitan warmup to
+  `int(steps * 0.005)` to match `nanoVLM_main` short-run semantics.
+- You can still override explicitly with
+  `--torchtitan-extra-args "--lr-scheduler.warmup_steps <N>"`.
 
 Example (vanilla):
 

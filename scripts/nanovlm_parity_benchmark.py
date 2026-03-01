@@ -33,6 +33,148 @@ class RunOutcome:
     peak_mem_at_sec: float | None
 
 
+def _load_trace_rows(trace_path: Path) -> list[dict]:
+    if not trace_path.exists():
+        return []
+    rows: list[dict] = []
+    with trace_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    return rows
+
+
+def _trace_fingerprint(row: dict) -> tuple[str, str, str, str]:
+    return (
+        str(row["input_ids"]["hash"]),
+        str(row["labels"]["hash"]),
+        str(row["attention_mask"]["hash"]),
+        str(row["images"]["hash"]),
+    )
+
+
+def _index_train_trace_rows(rows: list[dict]) -> dict[tuple[int, int], dict]:
+    indexed: dict[tuple[int, int], dict] = {}
+    for row in rows:
+        if row.get("event") != "train_microbatch":
+            continue
+        key = (int(row["update_step"]), int(row["microbatch_idx"]))
+        indexed[key] = row
+    return indexed
+
+
+def _compare_dataset_trace_rows(
+    baseline_rows: list[dict], torchtitan_rows: list[dict]
+) -> dict[str, object]:
+    baseline_indexed = _index_train_trace_rows(baseline_rows)
+    torchtitan_indexed = _index_train_trace_rows(torchtitan_rows)
+    baseline_sequence = [
+        row
+        for _, row in sorted(
+            baseline_indexed.items(), key=lambda item: (item[0][0], item[0][1])
+        )
+    ]
+    torchtitan_sequence = [
+        row
+        for _, row in sorted(
+            torchtitan_indexed.items(), key=lambda item: (item[0][0], item[0][1])
+        )
+    ]
+
+    def collect(offset: int) -> dict[str, object]:
+        compared = 0
+        exact = 0
+        mismatches: list[dict[str, object]] = []
+        for (step, microbatch_idx), baseline_row in sorted(baseline_indexed.items()):
+            torchtitan_key = (step + offset, microbatch_idx)
+            if torchtitan_key not in torchtitan_indexed:
+                continue
+            compared += 1
+            torchtitan_row = torchtitan_indexed[torchtitan_key]
+            baseline_fp = _trace_fingerprint(baseline_row)
+            torchtitan_fp = _trace_fingerprint(torchtitan_row)
+            if baseline_fp == torchtitan_fp:
+                exact += 1
+            elif len(mismatches) < 10:
+                mismatches.append(
+                    {
+                        "baseline_step": step,
+                        "torchtitan_step": step + offset,
+                        "microbatch_idx": microbatch_idx,
+                        "baseline_hashes": {
+                            "input_ids": baseline_row["input_ids"]["hash"],
+                            "labels": baseline_row["labels"]["hash"],
+                            "attention_mask": baseline_row["attention_mask"]["hash"],
+                            "images": baseline_row["images"]["hash"],
+                        },
+                        "torchtitan_hashes": {
+                            "input_ids": torchtitan_row["input_ids"]["hash"],
+                            "labels": torchtitan_row["labels"]["hash"],
+                            "attention_mask": torchtitan_row["attention_mask"]["hash"],
+                            "images": torchtitan_row["images"]["hash"],
+                        },
+                    }
+                )
+        match_ratio = (exact / compared) if compared else 0.0
+        return {
+            "offset": offset,
+            "compared_pairs": compared,
+            "exact_matches": exact,
+            "match_ratio": match_ratio,
+            "sample_mismatches": mismatches,
+        }
+
+    offset_summaries = [collect(offset) for offset in range(-4, 5)]
+    best = max(offset_summaries, key=lambda x: (x["exact_matches"], x["compared_pairs"]))
+
+    stream_shift_summaries: list[dict[str, object]] = []
+    for shift in range(-8, 9):
+        compared = 0
+        exact = 0
+        for baseline_idx, baseline_row in enumerate(baseline_sequence):
+            torchtitan_idx = baseline_idx + shift
+            if torchtitan_idx < 0 or torchtitan_idx >= len(torchtitan_sequence):
+                continue
+            compared += 1
+            if _trace_fingerprint(baseline_row) == _trace_fingerprint(
+                torchtitan_sequence[torchtitan_idx]
+            ):
+                exact += 1
+        stream_shift_summaries.append(
+            {
+                "shift": shift,
+                "compared_pairs": compared,
+                "exact_matches": exact,
+                "match_ratio": (exact / compared) if compared else 0.0,
+            }
+        )
+    best_stream_shift = max(
+        stream_shift_summaries, key=lambda x: (x["exact_matches"], x["compared_pairs"])
+    )
+
+    warmup_rows = [row for row in baseline_rows if row.get("event") == "warmup_discard"]
+    warmup_match = None
+    if warmup_rows:
+        warmup_fp = _trace_fingerprint(warmup_rows[0])
+        tt_first_key = min(torchtitan_indexed) if torchtitan_indexed else None
+        if tt_first_key is not None:
+            warmup_match = warmup_fp == _trace_fingerprint(torchtitan_indexed[tt_first_key])
+
+    return {
+        "baseline_rows": len(baseline_rows),
+        "torchtitan_rows": len(torchtitan_rows),
+        "baseline_train_rows": len(baseline_indexed),
+        "torchtitan_train_rows": len(torchtitan_indexed),
+        "best_alignment": best,
+        "offset_summaries": offset_summaries,
+        "best_stream_shift": best_stream_shift,
+        "stream_shift_summaries": stream_shift_summaries,
+        "warmup_matches_first_torchtitan_microbatch": warmup_match,
+    }
+
+
 def _sample_gpu_memory(mem_trace_path: Path, stop_event: threading.Event) -> None:
     start = time.perf_counter()
     with mem_trace_path.open("w", encoding="utf-8") as f:
@@ -338,6 +480,17 @@ def main() -> int:
         default="",
         help="Additional CLI args appended to the Torchtitan command.",
     )
+    parser.add_argument(
+        "--trace-dataset",
+        action="store_true",
+        help="Record and compare per-microbatch input fingerprints for both runs.",
+    )
+    parser.add_argument(
+        "--trace-max-updates",
+        type=int,
+        default=0,
+        help="If >0, only trace data for update steps up to this value.",
+    )
     args = parser.parse_args()
 
     if args.steps <= 0:
@@ -414,8 +567,13 @@ def main() -> int:
         "--metrics.log_freq 1 "
         f"--checkpoint.folder parity_{args.mode}_{args.steps}_{args.run_suffix}"
     )
-    if args.torchtitan_extra_args.strip():
-        torchtitan_cmd = f"{torchtitan_cmd} {args.torchtitan_extra_args.strip()}"
+    baseline_style_warmup_steps = int(args.steps * 0.005)
+    derived_warmup_arg = f"--lr-scheduler.warmup_steps {baseline_style_warmup_steps}"
+    extra_args = args.torchtitan_extra_args.strip()
+    if "--lr-scheduler.warmup_steps" not in extra_args:
+        extra_args = f"{extra_args} {derived_warmup_arg}".strip()
+    if extra_args:
+        torchtitan_cmd = f"{torchtitan_cmd} {extra_args}"
 
     env_common = {
         "WANDB_ENTITY": args.wandb_entity,
@@ -425,12 +583,31 @@ def main() -> int:
     print(f"[parity] output_dir={output_dir}")
     print(f"[parity] mode={args.mode}, steps={args.steps}")
 
+    baseline_trace_path = output_dir / "baseline.dataset_trace.jsonl"
+    torchtitan_trace_path = output_dir / "torchtitan.dataset_trace.jsonl"
+    if args.trace_dataset:
+        baseline_trace_path.write_text("", encoding="utf-8")
+        torchtitan_trace_path.write_text("", encoding="utf-8")
+
+    trace_max_updates = args.trace_max_updates if args.trace_max_updates > 0 else args.steps
+    trace_env = {}
+    if args.trace_dataset:
+        trace_env["NANOVLM_PARITY_TRACE_MAX_UPDATES"] = str(trace_max_updates)
+
     baseline_outcome = _run_command(
         command=baseline_cmd,
         workdir=nanovlm_root,
         log_path=output_dir / "baseline.log",
         mem_trace_path=output_dir / "baseline.mem.csv",
-        env_overrides=env_common,
+        env_overrides={
+            **env_common,
+            **trace_env,
+            **(
+                {"NANOVLM_PARITY_TRACE_PATH": str(baseline_trace_path)}
+                if args.trace_dataset
+                else {}
+            ),
+        },
     )
     baseline_text = baseline_outcome.log_path.read_text(encoding="utf-8")
     baseline_parsed = parse_nanovlm_log(baseline_text)
@@ -457,6 +634,12 @@ def main() -> int:
         env_overrides={
             **env_common,
             "WANDB_RUN_NAME": torchtitan_name,
+            **trace_env,
+            **(
+                {"NANOVLM_PARITY_TRACE_PATH": str(torchtitan_trace_path)}
+                if args.trace_dataset
+                else {}
+            ),
         },
     )
     if torchtitan_outcome.return_code != 0:
@@ -510,6 +693,13 @@ def main() -> int:
             for step, baseline_loss, torchtitan_loss, abs_diff in paired_rows
         ],
     }
+
+    if args.trace_dataset:
+        baseline_trace_rows = _load_trace_rows(baseline_trace_path)
+        torchtitan_trace_rows = _load_trace_rows(torchtitan_trace_path)
+        summary["dataset_trace"] = _compare_dataset_trace_rows(
+            baseline_trace_rows, torchtitan_trace_rows
+        )
 
     (output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2),

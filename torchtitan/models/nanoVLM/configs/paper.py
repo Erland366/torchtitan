@@ -373,7 +373,9 @@ def nanovlm_230m_momh_soft_gating_b5_tttv_nopack() -> Trainer.Config:
             implementation="foreach",
         ),
         lr_scheduler=LRSchedulersContainer.Config(
-            warmup_steps=50,
+            # Match nanoVLM_main get_lr warmup = max_training_steps * 0.005
+            # for this 2000-step schedule.
+            warmup_steps=10,
             decay_ratio=None,
             decay_type="cosine",
             min_lr_factor=0.1,
