@@ -148,8 +148,6 @@ class WandBLogger(BaseLogger):
         os.makedirs(log_dir, exist_ok=True)
 
         self.wandb.init(
-            # Keep backward compatibility with WANDB_TEAM while supporting the
-            # standard WANDB_ENTITY name used by nanoVLM_main workflows.
             entity=os.getenv("WANDB_ENTITY") or os.getenv("WANDB_TEAM", None),
             project=os.getenv("WANDB_PROJECT", "torchtitan"),
             name=os.getenv("WANDB_RUN_NAME", None),
@@ -301,9 +299,6 @@ class MetricsProcessor(Configurable):
 
         enable_wandb: bool = False
         """Whether to log metrics to Weights & Biases"""
-
-        track_peak_memory: bool = True
-        """Whether to query/reset peak device memory stats at every log step."""
 
     config: Config
     logger: BaseLogger
@@ -491,11 +486,7 @@ class MetricsProcessor(Configurable):
         time_data_loading = sum(self.data_loading_times) / len(self.data_loading_times)
         time_data_loading_pct = 100 * sum(self.data_loading_times) / time_delta
 
-        device_mem_stats = (
-            self.device_memory_monitor.get_peak_stats()
-            if self.config.track_peak_memory
-            else None
-        )
+        device_mem_stats = self.device_memory_monitor.get_peak_stats()
 
         metrics = {
             "loss_metrics/global_avg_loss": global_avg_loss,
@@ -505,21 +496,15 @@ class MetricsProcessor(Configurable):
             "tflops": tflops,
             "mfu(%)": mfu,
             "time_metrics/end_to_end(s)": time_end_to_end,
-            "time_metrics/s_per_it": time_end_to_end,
             "time_metrics/data_loading(s)": time_data_loading,
             "time_metrics/data_loading(%)": time_data_loading_pct,
+            "memory/max_active(GiB)": device_mem_stats.max_active_gib,
+            "memory/max_active(%)": device_mem_stats.max_active_pct,
+            "memory/max_reserved(GiB)": device_mem_stats.max_reserved_gib,
+            "memory/max_reserved(%)": device_mem_stats.max_reserved_pct,
+            "memory/num_alloc_retries": device_mem_stats.num_alloc_retries,
+            "memory/num_ooms": device_mem_stats.num_ooms,
         }
-        if device_mem_stats is not None:
-            metrics.update(
-                {
-                    "memory/max_active(GiB)": device_mem_stats.max_active_gib,
-                    "memory/max_active(%)": device_mem_stats.max_active_pct,
-                    "memory/max_reserved(GiB)": device_mem_stats.max_reserved_gib,
-                    "memory/max_reserved(%)": device_mem_stats.max_reserved_pct,
-                    "memory/num_alloc_retries": device_mem_stats.num_alloc_retries,
-                    "memory/num_ooms": device_mem_stats.num_ooms,
-                }
-            )
 
         if extra_metrics:
             metrics.update(extra_metrics)
@@ -527,45 +512,28 @@ class MetricsProcessor(Configurable):
         self.logger.log(metrics, step)
 
         color = self.color
-        if device_mem_stats is not None:
-            logger.info(
-                f"{color.red}step: {step:2}  "
-                f"{color.green}loss: {global_avg_loss:8.5f}  "
-                f"{color.orange}grad_norm: {grad_norm:7.4f}  "
-                f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
-                f"({device_mem_stats.max_reserved_pct:.2f}%)  "
-                f"{color.blue}tps: {round(tps):,}  "
-                f"{color.cyan}tflops: {tflops:,.2f}  "
-                f"{color.magenta}mfu: {mfu:.2f}%  "
-                f"{color.reset}{time_end_to_end:.2f}s/it"
-            )
-        else:
-            logger.info(
-                f"{color.red}step: {step:2}  "
-                f"{color.green}loss: {global_avg_loss:8.5f}  "
-                f"{color.orange}grad_norm: {grad_norm:7.4f}  "
-                f"{color.blue}tps: {round(tps):,}  "
-                f"{color.cyan}tflops: {tflops:,.2f}  "
-                f"{color.magenta}mfu: {mfu:.2f}%  "
-                f"{color.reset}{time_end_to_end:.2f}s/it"
-            )
+        logger.info(
+            f"{color.red}step: {step:2}  "
+            f"{color.green}loss: {global_avg_loss:8.5f}  "
+            f"{color.orange}grad_norm: {grad_norm:7.4f}  "
+            f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
+            f"({device_mem_stats.max_reserved_pct:.2f}%)  "
+            f"{color.blue}tps: {round(tps):,}  "
+            f"{color.cyan}tflops: {tflops:,.2f}  "
+            f"{color.magenta}mfu: {mfu:.2f}%{color.reset}"
+        )
 
         self.ntokens_since_last_log = 0
         self.data_loading_times.clear()
         self.time_last_log = time.perf_counter()
-        if self.config.track_peak_memory:
-            self.device_memory_monitor.reset_peak_stats()
+        self.device_memory_monitor.reset_peak_stats()
 
     def log_validation(
         self, loss: float, step: int, extra_metrics: dict[str, Any] | None = None
     ):
         time_delta = time.perf_counter() - self.time_last_log
 
-        device_mem_stats = (
-            self.device_memory_monitor.get_peak_stats()
-            if self.config.track_peak_memory
-            else None
-        )
+        device_mem_stats = self.device_memory_monitor.get_peak_stats()
 
         # tokens per second per device, abbreviated as tps
         tps = self.ntokens_since_last_log / (
@@ -575,16 +543,11 @@ class MetricsProcessor(Configurable):
         metrics = {
             "validation_metrics/loss": loss,
             "validation_metrics/throughput(tps)": tps,
+            "validation_metrics/memory/max_active(GiB)": device_mem_stats.max_active_gib,
+            "validation_metrics/memory/max_active(%)": device_mem_stats.max_active_pct,
+            "validation_metrics/memory/max_reserved(GiB)": device_mem_stats.max_reserved_gib,
+            "validation_metrics/memory/max_reserved(%)": device_mem_stats.max_reserved_pct,
         }
-        if device_mem_stats is not None:
-            metrics.update(
-                {
-                    "validation_metrics/memory/max_active(GiB)": device_mem_stats.max_active_gib,
-                    "validation_metrics/memory/max_active(%)": device_mem_stats.max_active_pct,
-                    "validation_metrics/memory/max_reserved(GiB)": device_mem_stats.max_reserved_gib,
-                    "validation_metrics/memory/max_reserved(%)": device_mem_stats.max_reserved_pct,
-                }
-            )
 
         if extra_metrics:
             metrics.update(extra_metrics)
@@ -592,25 +555,17 @@ class MetricsProcessor(Configurable):
         self.logger.log(metrics, step)
 
         color = self.color
-        if device_mem_stats is not None:
-            logger.info(
-                f"{color.yellow}validate step: {step:2}  "
-                f"{color.green}loss: {loss:7.4f}  "
-                f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
-                f"({device_mem_stats.max_reserved_pct:.2f}%)  "
-                f"{color.blue}tps: {round(tps):,}{color.reset}"
-            )
-        else:
-            logger.info(
-                f"{color.yellow}validate step: {step:2}  "
-                f"{color.green}loss: {loss:7.4f}  "
-                f"{color.blue}tps: {round(tps):,}{color.reset}"
-            )
+        logger.info(
+            f"{color.yellow}validate step: {step:2}  "
+            f"{color.green}loss: {loss:7.4f}  "
+            f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
+            f"({device_mem_stats.max_reserved_pct:.2f}%)  "
+            f"{color.blue}tps: {round(tps):,}{color.reset}"
+        )
 
         self.ntokens_since_last_log = 0
         self.time_last_log = time.perf_counter()
-        if self.config.track_peak_memory:
-            self.device_memory_monitor.reset_peak_stats()
+        self.device_memory_monitor.reset_peak_stats()
 
     def close(self):
         self.logger.close()

@@ -18,6 +18,23 @@ Each entry should include:
 
 - **Date**: 2026-03-01
 - **Type**: Retrospective
+- **General description**: Upstream-first runtime alignment completed; speed and VRAM targets passed, exact loss parity still open.
+- **Details**:
+  - Reverted shared TorchTitan runtime behavior toward upstream in `trainer.py`, `checkpoint.py`, and `metrics.py`.
+  - Added model-local HF checkpoint adaptation hook:
+    - protocol method in `protocols/state_dict_adapter.py`
+    - nanoVLM implementation in `models/nanoVLM/state_dict_adapter.py`
+  - Vanilla short A/B evidence (5 steps):
+    - TorchTitan avg tps (steps 2-5): `37620.75`, peak VRAM: `21767 MiB`
+    - nanoVLM_main avg tokens/s (steps 2-5): `15650.78`, peak VRAM: `27443 MiB`
+    - deltas: ~`2.40x` speedup and `5676 MiB` lower VRAM on TorchTitan
+  - Soft-gating smoke passed after refactor; compiled-key remap confirmed (`remapped=270`, `dropped=0`).
+  - Exact loss parity remains unresolved and requires deeper controlled triangulation.
+
+## 2026-03-01
+
+- **Date**: 2026-03-01
+- **Type**: Retrospective
 - **General description**: Soft-gating keeps speed/VRAM wins, but exact parity still fails and recent parity-hypothesis edits regressed loss matching.
 - **Details**:
   - Revalidated current best 100-step reference pair:

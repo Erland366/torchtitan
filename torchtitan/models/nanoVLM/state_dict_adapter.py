@@ -5,6 +5,7 @@ and export torchtitan checkpoints back to original nanoVLM format.
 
 import json
 import os
+import re
 from typing import Any
 
 import torch
@@ -27,16 +28,6 @@ class NanoVLMStateDictAdapter(BaseStateDictAdapter):
         self.model_config = model_config
         self.hf_assets_path = hf_assets_path
         self.fqn_to_index_mapping = None
-        # Enforce explicit HF-load coverage checks in CheckpointManager.
-        # We intentionally allow:
-        # - vision_encoder.layers.* (ModuleDict alias of blocks.*)
-        # - rotary_embd.inv_freq (recomputed buffer)
-        # - momh_gate params (soft-gating injection from vanilla checkpoints)
-        self.validate_hf_load_keys = True
-        self.hf_load_drop_prefixes = ("vision_encoder.layers.",)
-        self.hf_load_drop_exact = ("rotary_embd.inv_freq",)
-        self.hf_load_allowed_missing_prefixes = ()
-        self.hf_load_allowed_missing_substrings = ("momh_gate",)
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         """Convert torchtitan nanoVLM state dict to original nanoVLM format.
@@ -67,8 +58,7 @@ class NanoVLMStateDictAdapter(BaseStateDictAdapter):
             # Skip rotary embedding buffer (recomputed on load)
             if key == "rotary_embd.inv_freq":
                 continue
-            # Skip MoMH soft-gating params (not present in vanilla checkpoints,
-            # will be left at init values via strict=False in load_state_dict)
+            # Skip MoMH soft-gating params (not present in vanilla checkpoints).
             if ".momh_gate" in key:
                 continue
 
@@ -323,3 +313,65 @@ class NanoVLMStateDictAdapter(BaseStateDictAdapter):
         self, path: str, from_quantized: bool = False
     ) -> HuggingFaceStorageReader:
         return HuggingFaceStorageReader(path)
+
+    def _get_hf_checkpoint_keys(self, checkpoint_id: str) -> set[str]:
+        """Return tensor keys available in an HF safetensors checkpoint folder."""
+        index_path = os.path.join(checkpoint_id, "model.safetensors.index.json")
+        single_file_path = os.path.join(checkpoint_id, "model.safetensors")
+
+        if os.path.isfile(index_path):
+            with open(index_path, "r", encoding="utf-8") as f:
+                index = json.load(f)
+            weight_map = index.get("weight_map", {})
+            if isinstance(weight_map, dict):
+                return set(weight_map.keys())
+
+        if os.path.isfile(single_file_path):
+            from safetensors import safe_open
+
+            with safe_open(single_file_path, framework="pt", device="cpu") as f:
+                return set(f.keys())
+
+        return set()
+
+    def adapt_hf_state_dict_for_checkpoint(
+        self, hf_state_dict: dict[str, Any], checkpoint_id: str
+    ) -> dict[str, Any]:
+        """Adapt expected HF keys to checkpoint contents.
+
+        Some older checkpoints store compiled decoder keys
+        (`decoder.blocks.{i}._orig_mod.*`). When this is detected, remap
+        expected keys so `dcp.load` can populate tensors correctly.
+        """
+        available_keys = self._get_hf_checkpoint_keys(checkpoint_id)
+        if not available_keys:
+            return hf_state_dict
+
+        filtered: dict[str, Any] = {}
+        remapped = 0
+        dropped = 0
+
+        for key, tensor in hf_state_dict.items():
+            if key in available_keys:
+                filtered[key] = tensor
+                continue
+
+            match = re.match(r"^(decoder\.blocks\.\d+\.)(.+)$", key)
+            if match:
+                compiled_key = f"{match.group(1)}_orig_mod.{match.group(2)}"
+                if compiled_key in available_keys:
+                    filtered[compiled_key] = tensor
+                    remapped += 1
+                    continue
+
+            dropped += 1
+
+        if remapped or dropped:
+            logger.info(
+                "HF key adaptation: remapped=%d, dropped=%d, kept=%d",
+                remapped,
+                dropped,
+                len(filtered),
+            )
+
+        return filtered

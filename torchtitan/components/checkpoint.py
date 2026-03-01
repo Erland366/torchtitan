@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import enum
 import functools
-import json
 import os
 import queue
 import re
@@ -618,7 +617,7 @@ class CheckpointManager(Configurable):
                 self.sd_adapter is not None
             ), "trying to load checkpoint in HF safetensors format, but sd_adapter is not provided."
             hf_state_dict = self.sd_adapter.to_hf(state_dict)
-            hf_state_dict = self._maybe_filter_hf_state_dict_for_checkpoint(
+            hf_state_dict = self.sd_adapter.adapt_hf_state_dict_for_checkpoint(
                 hf_state_dict, checkpoint_id
             )
             hf_storage_reader = self.sd_adapter.get_hf_storage_reader(
@@ -631,67 +630,7 @@ class CheckpointManager(Configurable):
             )
 
             state_dict = self.sd_adapter.from_hf(hf_state_dict)
-            model = self.states[MODEL]
-            model.load_state_dict(state_dict)
-
-            if getattr(self.sd_adapter, "validate_hf_load_keys", False):
-                def _normalize_key(key: str) -> str:
-                    return key.replace("._orig_mod.", ".")
-
-                drop_prefixes = tuple(
-                    getattr(self.sd_adapter, "hf_load_drop_prefixes", ())
-                )
-                drop_exact = set(getattr(self.sd_adapter, "hf_load_drop_exact", ()))
-                allowed_missing_prefixes = tuple(
-                    getattr(self.sd_adapter, "hf_load_allowed_missing_prefixes", ())
-                )
-                allowed_missing_substrings = tuple(
-                    getattr(self.sd_adapter, "hf_load_allowed_missing_substrings", ())
-                )
-
-                def _should_drop(key: str) -> bool:
-                    return key in drop_exact or any(
-                        key.startswith(prefix) for prefix in drop_prefixes
-                    )
-
-                def _is_allowed_missing(key: str) -> bool:
-                    return any(
-                        key.startswith(prefix) for prefix in allowed_missing_prefixes
-                    ) or any(substr in key for substr in allowed_missing_substrings)
-
-                expected_raw = set(model.state_dict().keys())
-                expected = {
-                    _normalize_key(key)
-                    for key in expected_raw
-                    if not _should_drop(_normalize_key(key))
-                }
-                loaded = {
-                    _normalize_key(key)
-                    for key in state_dict.keys()
-                    if not _should_drop(_normalize_key(key))
-                }
-
-                missing = sorted(expected - loaded)
-                unexpected = sorted(loaded - expected)
-                disallowed_missing = [
-                    key for key in missing if not _is_allowed_missing(key)
-                ]
-
-                if disallowed_missing:
-                    raise RuntimeError(
-                        "Missing non-allowlisted keys while loading HF checkpoint: "
-                        f"{disallowed_missing[:10]}"
-                    )
-                if unexpected:
-                    raise RuntimeError(
-                        "Unexpected keys while loading HF checkpoint: "
-                        f"{unexpected[:10]}"
-                    )
-                if missing:
-                    logger.info(
-                        "HF checkpoint loaded with %d allowlisted missing keys.",
-                        len(missing),
-                    )
+            self.states[MODEL].load_state_dict(state_dict)
         else:
             dcp.load(state_dict, checkpoint_id=checkpoint_id)
 
@@ -699,69 +638,6 @@ class CheckpointManager(Configurable):
             # manually call load_state_dict() for the model. Need to fix this.
             if MODEL in self.states:
                 self.states[MODEL].load_state_dict(state_dict)
-
-    def _get_hf_checkpoint_keys(self, checkpoint_id: str) -> set[str]:
-        """Return tensor keys available in an HF safetensors checkpoint folder."""
-        index_path = os.path.join(checkpoint_id, "model.safetensors.index.json")
-        single_file_path = os.path.join(checkpoint_id, "model.safetensors")
-
-        if os.path.isfile(index_path):
-            with open(index_path, "r", encoding="utf-8") as f:
-                index = json.load(f)
-            weight_map = index.get("weight_map", {})
-            if isinstance(weight_map, dict):
-                return set(weight_map.keys())
-
-        if os.path.isfile(single_file_path):
-            from safetensors import safe_open
-
-            with safe_open(single_file_path, framework="pt", device="cpu") as f:
-                return set(f.keys())
-
-        return set()
-
-    def _maybe_filter_hf_state_dict_for_checkpoint(
-        self, hf_state_dict: dict[str, Any], checkpoint_id: str
-    ) -> dict[str, Any]:
-        """Align expected HF keys with what exists in checkpoint files.
-
-        Older nanoVLM checkpoints may have compiled wrapper keys
-        (`decoder.blocks.{i}._orig_mod.*`) and can also miss newly-added
-        soft-gating parameters. Filter/remap keys to what the checkpoint can
-        actually provide, then rely on strict=False model load (for adapters
-        that opt in) to keep newly-added params at init values.
-        """
-        available_keys = self._get_hf_checkpoint_keys(checkpoint_id)
-        if not available_keys:
-            return hf_state_dict
-
-        filtered: dict[str, Any] = {}
-        remapped = 0
-        dropped = 0
-
-        for key, tensor in hf_state_dict.items():
-            if key in available_keys:
-                filtered[key] = tensor
-                continue
-
-            # Support checkpoints saved from compiled decoder blocks.
-            match = re.match(r"^(decoder\.blocks\.\d+\.)(.+)$", key)
-            if match:
-                compiled_key = f"{match.group(1)}_orig_mod.{match.group(2)}"
-                if compiled_key in available_keys:
-                    filtered[compiled_key] = tensor
-                    remapped += 1
-                    continue
-
-            dropped += 1
-
-        if remapped or dropped:
-            logger.info(
-                f"HF key adaptation: remapped={remapped}, dropped={dropped}, "
-                f"kept={len(filtered)}"
-            )
-
-        return filtered
 
     @torch.no_grad()
     def save(self, curr_step: int, last_step: bool = False) -> None:

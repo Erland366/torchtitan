@@ -6,7 +6,6 @@
 
 import dataclasses
 import json
-import math
 import os
 import time
 from collections.abc import Iterable, Iterator
@@ -534,24 +533,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 # entire step will not be executed.
                 raise DataloaderExhaustedError() from ex
             input_dict, labels = batch
-
-            # Keep parity with nanoVLM_main's _is_batch_valid filtering:
-            # skip empty batches and batches that carry no images.
-            inputs = input_dict.get("input")
-            images = input_dict.get("images")
-            if (
-                inputs is None
-                or labels is None
-                or inputs.numel() == 0
-                or labels.numel() == 0
-            ):
-                continue
-            if isinstance(images, torch.Tensor):
-                if images.numel() == 0:
-                    continue
-            elif isinstance(images, list):
-                raise TypeError("Expected collated `images` to be a tensor, got list")
-
             ntokens_batch = labels.numel()
             self.ntokens_seen += ntokens_batch
             self.metrics_processor.ntokens_since_last_log += ntokens_batch
@@ -637,6 +618,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         *,
         input_dict: dict[str, torch.Tensor],
         labels: torch.Tensor,
+        global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
         model_parts = self.model_parts
         parallel_dims = self.parallel_dims
@@ -646,178 +628,115 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         )
 
         if parallel_dims.pp_enabled:
-            raise NotImplementedError(
-                "Token-normalized streaming train_step is only supported for non-PP runs."
+            # Pipeline Parallel forward / backward inside step() call
+            with self.train_context():
+                targets, losses = (
+                    (labels, []) if self.pp_has_last_stage else (None, None)
+                )
+                if self.pp_has_first_stage:
+                    self.pp_schedule.step(
+                        inputs,
+                        **extra_inputs,
+                        **extra_kwargs,
+                        target=targets,
+                        losses=losses,
+                        return_outputs=False,
+                    )
+                else:
+                    self.pp_schedule.step(
+                        **extra_kwargs,
+                        target=targets,
+                        losses=losses,
+                        return_outputs=False,
+                    )
+
+            # accumulate losses across pipeline microbatches
+            # TODO: PP+FSDP unexpectedly puts the loss back to the CPU
+            loss = (
+                # Rescale PP loss to be "local loss sum / global valid tokens)
+                # because each microbathes could have different number of valid tokens
+                (torch.sum(torch.stack(losses)) / global_valid_tokens).to(self.device)
+                if self.pp_has_last_stage
+                else torch.tensor([-1.0], device=self.device)
             )
+        else:
+            # Non-PP forward / backward
+            assert len(model_parts) == 1
+            with self.train_context():
+                with self.maybe_enable_amp:
+                    pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
+                    # Compute loss sum (reduction='sum')
+                    loss_sum = self.loss_fn(pred, labels)
 
-        # Non-PP forward / backward
-        assert len(model_parts) == 1
-        with self.train_context():
-            with self.maybe_enable_amp:
-                pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
-                # Keep unreduced-token normalization semantics from nanoVLM_main:
-                # backward on local loss sums, then normalize grads once per update.
-                loss_sum = self.loss_fn(pred, labels)
+                    # Scale the loss by the inverse of the total weight denominator before backward
+                    # This ensures gradients are properly normalized across all microbatches
+                    loss = loss_sum / global_valid_tokens
 
-            # need to free pred before bwd to avoid peaking memory
-            del pred
-            loss_sum.backward()
+                # need to free pred before bwd to avoid peaking memory
+                del pred
+                loss.backward()
 
-        # The returned loss is local SUM loss (un-normalized).
-        return loss_sum
-
-    @staticmethod
-    def _nanovlm_get_lr(step: int, max_lr: float, max_steps: int) -> float:
-        """Mirror nanoVLM_main Karpathy-style cosine LR schedule exactly."""
-        min_lr = max_lr * 0.1
-        warmup_steps = max_steps * 0.005
-        if step < warmup_steps:
-            if warmup_steps <= 0:
-                raise ValueError("warmup_steps must be > 0 in warmup branch")
-            return max_lr * (step + 1) / warmup_steps
-        if step > max_steps:
-            return min_lr
-        decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
-        if not 0 <= decay_ratio <= 1:
-            raise ValueError(
-                f"Invalid LR decay ratio={decay_ratio} for step={step}, "
-                f"max_steps={max_steps}, warmup_steps={warmup_steps}"
-            )
-        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-        return min_lr + coeff * (max_lr - min_lr)
-
-    def _maybe_apply_nanovlm_manual_lr(self) -> float | None:
-        """Apply nanoVLM per-param-group LR schedule when nanoVLM groups are present."""
-        named_groups: list[dict[str, Any]] = []
-        has_nanovlm_lr_groups = False
-        for optimizer in self.optimizers:
-            for group in optimizer.param_groups:
-                if "name" in group:
-                    named_groups.append(group)
-                if "max_lr" in group:
-                    has_nanovlm_lr_groups = True
-
-        # For nanoVLM we key off "max_lr" (set by NanoVLMOptimizersContainer)
-        # instead of strict group-name checks, so schedule order remains robust
-        # if group naming evolves.
-        if not named_groups or not has_nanovlm_lr_groups:
-            return None
-
-        max_steps = self.config.training.steps
-        logged_lr: float | None = None
-        for group in named_groups:
-            max_lr = float(group.get("max_lr", group.get("initial_lr", group["lr"])))
-            if max_lr <= 0:
-                continue
-            new_lr = self._nanovlm_get_lr(self.step, max_lr, max_steps)
-            group["lr"] = new_lr
-            if group.get("name") == "lm":
-                logged_lr = new_lr
-            elif logged_lr is None:
-                logged_lr = new_lr
-
-        return logged_lr
+        # The returned loss here is local SUM loss / global_valid_tokens
+        return loss
 
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
         self.optimizers.zero_grad()
+        # Save the current step learning rate for logging
+        lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
 
         # Keep these variables local to shorten the code as these are
         # the major variables that are used in the training loop.
         parallel_dims = self.parallel_dims
 
-        # Stream microbatches directly into compute (no pre-buffering), then
-        # normalize gradients once per optimizer update by global valid tokens.
-        local_valid_tokens = torch.tensor(0, dtype=torch.int64, device=self.device)
-        accumulated_losses = []
-        for _ in range(self.gradient_accumulation_steps):
+        # Collect all microbatches on CPU and count total valid tokens
+        microbatches = []
+        local_valid_tokens = torch.tensor(0, dtype=torch.int64)
+        for _microbatch in range(self.gradient_accumulation_steps):
             input_dict, labels = next(data_iterator)
+            local_valid_tokens += (labels != IGNORE_INDEX).sum()
+            microbatches.append((input_dict, labels))
 
+        # All-reduce to get global token count across DP ranks
+        # Move to GPU for distributed communication
+        local_valid_tokens = local_valid_tokens.to(self.device)
+        if parallel_dims.dp_enabled:
+            batch_mesh = parallel_dims.get_mesh("batch")
+            global_valid_tokens = dist_utils.dist_sum(local_valid_tokens, batch_mesh)
+        else:
+            global_valid_tokens = local_valid_tokens.float()
+
+        # Process each microbatch: move to GPU, forward/backward, then free
+        accumulated_losses = []
+        for input_dict, labels in microbatches:
             # Move tensors to GPU
             for k, v in input_dict.items():
                 if isinstance(v, torch.Tensor):
                     input_dict[k] = v.to(self.device)
             labels = labels.to(self.device)
-            local_valid_tokens += (labels != IGNORE_INDEX).sum()
 
-            # Keep parity with nanoVLM_main: mark dynamic only on token tensors.
-            # Marking image tensors here adds overhead and can trigger extra guards.
-            if self.config.compile.enable and "model" in self.config.compile.components:
-                maybe_mark_dynamic = getattr(torch._dynamo, "maybe_mark_dynamic", None)
-                dynamic_tensors = (
-                    input_dict.get("input"),
-                    labels,
-                    input_dict.get("attention_mask"),
-                )
-                for tensor in dynamic_tensors:
-                    if not isinstance(tensor, torch.Tensor) or tensor.dim() < 2:
-                        continue
-                    if maybe_mark_dynamic is not None:
-                        maybe_mark_dynamic(tensor, 0)
-                        maybe_mark_dynamic(tensor, 1)
-                    else:
-                        torch._dynamo.mark_dynamic(tensor, 0)
-                        torch._dynamo.mark_dynamic(tensor, 1)
-
-            loss_sum = self.forward_backward_step(
+            loss = self.forward_backward_step(
                 input_dict=input_dict,
                 labels=labels,
+                # pyrefly: ignore [bad-argument-type]
+                global_valid_tokens=global_valid_tokens,
             )
-            accumulated_losses.append(loss_sum.detach())
+            accumulated_losses.append(loss.detach())
 
-        # All-reduce to get global token count across DP ranks.
-        if parallel_dims.dp_enabled:
-            batch_mesh = parallel_dims.get_mesh("batch")
-            global_valid_tokens = dist_utils.dist_sum(local_valid_tokens, batch_mesh)
-        else:
-            global_valid_tokens = local_valid_tokens
-        global_valid_tokens = global_valid_tokens.to(dtype=torch.float32)
-
-        global_valid_tokens_value = float(global_valid_tokens.item())
-        if global_valid_tokens_value <= 0:
-            raise ValueError("Global valid token count must be > 0 for gradient normalization.")
-
-        # Match nanoVLM_main scaling: DDP averages grads by world-size, so we
-        # multiply by world-size / global_valid_tokens to recover token-normalized grads.
-        world_size = (
-            torch.distributed.get_world_size()
-            if torch.distributed.is_available() and torch.distributed.is_initialized()
-            else 1
+        grad_norm = dist_utils.clip_grad_norm_(
+            [p for m in self.model_parts for p in m.parameters()],
+            self.config.training.max_norm,
+            foreach=True,
+            pp_mesh=parallel_dims.get_optional_mesh("pp"),
+            ep_enabled=parallel_dims.ep_enabled,
         )
-        grad_scale = world_size / global_valid_tokens_value
-        for model_part in self.model_parts:
-            for param in model_part.parameters():
-                if param.grad is not None:
-                    param.grad.mul_(grad_scale)
-
-        params = [p for m in self.model_parts for p in m.parameters()]
-        pp_mesh = parallel_dims.get_optional_mesh("pp")
-        if pp_mesh is None and not parallel_dims.ep_enabled:
-            # Keep parity with nanoVLM_main when no PP/EP mesh is active.
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                params,
-                self.config.training.max_norm,
-            )
-        else:
-            grad_norm = dist_utils.clip_grad_norm_(
-                params,
-                self.config.training.max_norm,
-                foreach=None,
-                pp_mesh=pp_mesh,
-                ep_enabled=parallel_dims.ep_enabled,
-            )
-        manual_lr = self._maybe_apply_nanovlm_manual_lr()
         self.checkpointer.maybe_wait_for_staging()
         self.optimizers.step()
-        if manual_lr is None:
-            self.lr_schedulers.step()
-            lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
-        else:
-            lr = manual_lr
+        self.lr_schedulers.step()
 
         # Reduce the data collected over gradient accumulation steps.
-        loss = torch.sum(torch.stack(accumulated_losses)) / global_valid_tokens
+        loss = torch.sum(torch.stack(accumulated_losses))
 
         # log metrics
         if not self.metrics_processor.should_log(self.step):
@@ -854,13 +773,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         extra_metrics = {
             "n_tokens_seen": global_ntokens_seen,
             "lr": lr,
-            "train/batch_loss": global_avg_loss,
         }
-        # Harvest model-specific extra metrics (e.g., MoMH gates)
-        for model_part in self.model_parts:
-            if hasattr(model_part, "_nanovlm_extra_metrics"):
-                extra_metrics.update(model_part._nanovlm_extra_metrics)
-
         self.metrics_processor.log(
             self.step,
             global_avg_loss,
@@ -888,18 +801,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 base_folder=config.dump_folder,
             ) as memory_profiler,
         ):
-            raw_data_iterator = iter(self.dataloader)
-            if self.step == 0:
-                try:
-                    # Match nanoVLM_main startup behavior: warm dataloader workers
-                    # and consume one train microbatch before step 1.
-                    next(raw_data_iterator)
-                    logger.info(
-                        "Dataloader warmup complete (consumed one pre-step microbatch)"
-                    )
-                except StopIteration as ex:
-                    raise DataloaderExhaustedError() from ex
-            data_iterator = self.batch_generator(raw_data_iterator)
+            data_iterator = self.batch_generator(self.dataloader)
             while self.should_continue_training():
                 self.step += 1
                 self.gc_handler.run(self.step)

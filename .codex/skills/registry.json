@@ -31,6 +31,14 @@
     "torchtitan-parity-harness-resilience": {
       "type": "result",
       "description": "Rules to keep paired parity benchmarks valid when baseline teardown crashes occur after full completion"
+    },
+    "torchtitan-upstream-alignment-guardrail": {
+      "type": "result",
+      "description": "Keep shared TorchTitan runtime upstream-first and move model quirks into adapters/hooks"
+    },
+    "vlm-loss-parity-triangulation": {
+      "type": "result",
+      "description": "Protocol to isolate loss mismatch after speed/VRAM goals are already satisfied"
     }
   },
   "paths": {

@@ -77,6 +77,17 @@ class BaseStateDictAdapter(ABC):
         """
         pass
 
+    def adapt_hf_state_dict_for_checkpoint(
+        self, hf_state_dict: dict[str, Any], checkpoint_id: str
+    ) -> dict[str, Any]:
+        """Optional model-specific adaptation before HF checkpoint load.
+
+        By default this is a no-op. Models can override this to remap or
+        filter expected keys based on checkpoint contents.
+        """
+        del checkpoint_id
+        return hf_state_dict
+
 
 class StateDictAdapter(BaseStateDictAdapter):
     """State dict adapter base class which provides convenient default behavior to build fqn_to_index_mapping"""
