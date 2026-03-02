@@ -116,6 +116,34 @@ def _max_trace_updates() -> int | None:
     return int(raw_value)
 
 
+def _compute_effective_token_ratio(effective_tokens: float, token_capacity: float) -> float:
+    token_capacity_value = float(token_capacity)
+    if token_capacity_value <= 0:
+        raise ValueError("Token capacity must be > 0 when computing effective token ratio.")
+    return float(effective_tokens) / token_capacity_value
+
+
+def _extract_images_per_sample(images: Any, fallback_batch_size: int) -> list[int]:
+    if isinstance(images, list):
+        image_counts: list[int] = []
+        for sample_images in images:
+            if isinstance(sample_images, list):
+                image_counts.append(len(sample_images))
+            elif isinstance(sample_images, torch.Tensor):
+                if sample_images.ndim == 4:
+                    image_counts.append(int(sample_images.shape[0]))
+                else:
+                    image_counts.append(1)
+            else:
+                image_counts.append(0)
+        return image_counts
+
+    if isinstance(images, torch.Tensor) and images.ndim >= 4:
+        return [1 for _ in range(int(images.shape[0]))]
+
+    return [0 for _ in range(max(fallback_batch_size, 0))]
+
+
 class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
@@ -247,6 +275,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     # additional training states
     step: int
     ntokens_seen: int
+    nanovlm_effective_tokens_seen: int
 
     # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
     @record
@@ -499,6 +528,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # These attributes must be initialized before checkpoint loading.
         self.step = 0
         self.ntokens_seen = 0
+        self.nanovlm_effective_tokens_seen = 0
+        self._is_nanovlm = model_spec.name == "nanoVLM"
+        self._reset_nanovlm_training_stats_window()
 
         self.checkpointer = config.checkpoint.build(
             dataloader=self.dataloader,
@@ -612,6 +644,177 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
             # Tensors stay on CPU; moved to GPU per-microbatch during training
             yield input_dict, labels
+
+    def _reset_nanovlm_training_stats_window(self) -> None:
+        self._nanovlm_training_stats_window = {
+            "tokens_per_second_sum": 0.0,
+            "tokens_per_second_count": 0,
+            "data_load_time_sum": 0.0,
+            "data_load_time_count": 0,
+            "data_load_time_max": 0.0,
+            "fw_bw_time_sum": 0.0,
+            "fw_bw_time_count": 0,
+            "fw_bw_time_max": 0.0,
+            "post_process_time_sum": 0.0,
+            "post_process_time_count": 0,
+            "post_process_time_max": 0.0,
+            "effective_token_ratio_sum": 0.0,
+            "effective_token_ratio_count": 0,
+            "images_per_sample_sum": 0.0,
+            "images_per_sample_count": 0,
+            "images_per_sample_min": float("inf"),
+            "images_per_sample_max": 0.0,
+        }
+
+    def _dist_reduce_scalar(
+        self, value: float, op: torch.distributed.ReduceOp
+    ) -> float:
+        if not torch.distributed.is_initialized():
+            return float(value)
+        reduced = torch.tensor(value, dtype=torch.float64, device=self.device)
+        torch.distributed.all_reduce(reduced, op=op)
+        return float(reduced.item())
+
+    def _update_nanovlm_training_stats_window(
+        self,
+        *,
+        tokens_per_second: float,
+        data_load_time: float,
+        fw_bw_time: float,
+        post_process_time: float,
+        effective_token_ratio: float,
+        images_per_sample: list[int],
+    ) -> None:
+        stats = self._nanovlm_training_stats_window
+        stats["tokens_per_second_sum"] += float(tokens_per_second)
+        stats["tokens_per_second_count"] += 1
+
+        stats["data_load_time_sum"] += float(data_load_time)
+        stats["data_load_time_count"] += 1
+        stats["data_load_time_max"] = max(
+            float(stats["data_load_time_max"]), float(data_load_time)
+        )
+
+        stats["fw_bw_time_sum"] += float(fw_bw_time)
+        stats["fw_bw_time_count"] += 1
+        stats["fw_bw_time_max"] = max(float(stats["fw_bw_time_max"]), float(fw_bw_time))
+
+        stats["post_process_time_sum"] += float(post_process_time)
+        stats["post_process_time_count"] += 1
+        stats["post_process_time_max"] = max(
+            float(stats["post_process_time_max"]), float(post_process_time)
+        )
+
+        stats["effective_token_ratio_sum"] += float(effective_token_ratio)
+        stats["effective_token_ratio_count"] += 1
+
+        if images_per_sample:
+            image_sum = float(sum(images_per_sample))
+            image_count = int(len(images_per_sample))
+            image_min = float(min(images_per_sample))
+            image_max = float(max(images_per_sample))
+            stats["images_per_sample_sum"] += image_sum
+            stats["images_per_sample_count"] += image_count
+            stats["images_per_sample_min"] = min(
+                float(stats["images_per_sample_min"]), image_min
+            )
+            stats["images_per_sample_max"] = max(
+                float(stats["images_per_sample_max"]), image_max
+            )
+
+    def _build_nanovlm_lr_metrics(self) -> dict[str, float]:
+        lr_metrics: dict[str, float] = {}
+        name_map = {
+            "projector": "lr_mp",
+            "vision": "lr_vision_backbone",
+            "lm": "lr_language_backbone",
+        }
+
+        for optimizer in self.optimizers.optimizers:
+            for group_idx, group in enumerate(optimizer.param_groups):
+                group_name = group.get("name")
+                if group_name is None:
+                    group_name = f"group_{group_idx}"
+                metric_name = name_map.get(group_name, group_name)
+                key = f"training_stats/{metric_name}"
+                lr_metrics[key] = float(group["lr"])
+        return lr_metrics
+
+    def _build_nanovlm_training_stats_metrics(self, grad_norm: float) -> dict[str, float]:
+        stats = self._nanovlm_training_stats_window
+        if stats["tokens_per_second_count"] <= 0:
+            return {}
+
+        def _global_mean(sum_key: str, count_key: str) -> float:
+            global_sum = self._dist_reduce_scalar(
+                float(stats[sum_key]),
+                torch.distributed.ReduceOp.SUM,
+            )
+            global_count = self._dist_reduce_scalar(
+                float(stats[count_key]),
+                torch.distributed.ReduceOp.SUM,
+            )
+            if global_count <= 0:
+                return 0.0
+            return global_sum / global_count
+
+        result: dict[str, float] = {
+            "training_stats/avg_tokens_per_second": _global_mean(
+                "tokens_per_second_sum", "tokens_per_second_count"
+            ),
+            "training_stats/avg_data_load_time": _global_mean(
+                "data_load_time_sum", "data_load_time_count"
+            ),
+            "training_stats/avg_fw_bw_time": _global_mean(
+                "fw_bw_time_sum", "fw_bw_time_count"
+            ),
+            "training_stats/avg_post_process_time": _global_mean(
+                "post_process_time_sum", "post_process_time_count"
+            ),
+            "training_stats/avg_effective_token_ratio": _global_mean(
+                "effective_token_ratio_sum", "effective_token_ratio_count"
+            ),
+            "training_stats/avg_images_per_sample": _global_mean(
+                "images_per_sample_sum", "images_per_sample_count"
+            ),
+            "training_stats/max_data_load_time": self._dist_reduce_scalar(
+                float(stats["data_load_time_max"]),
+                torch.distributed.ReduceOp.MAX,
+            ),
+            "training_stats/max_fw_bw_time": self._dist_reduce_scalar(
+                float(stats["fw_bw_time_max"]),
+                torch.distributed.ReduceOp.MAX,
+            ),
+            "training_stats/max_post_process_time": self._dist_reduce_scalar(
+                float(stats["post_process_time_max"]),
+                torch.distributed.ReduceOp.MAX,
+            ),
+            "training_stats/max_images_per_sample": self._dist_reduce_scalar(
+                float(stats["images_per_sample_max"]),
+                torch.distributed.ReduceOp.MAX,
+            ),
+            "training_stats/grad_norm": float(grad_norm),
+        }
+
+        if stats["images_per_sample_count"] > 0:
+            result["training_stats/min_images_per_sample"] = self._dist_reduce_scalar(
+                float(stats["images_per_sample_min"]),
+                torch.distributed.ReduceOp.MIN,
+            )
+
+        result.update(self._build_nanovlm_lr_metrics())
+        return result
+
+    def _collect_nanovlm_model_extra_metrics(self) -> dict[str, float]:
+        metrics: dict[str, float] = {}
+        for model_part in self.model_parts:
+            part_metrics = getattr(model_part, "_nanovlm_extra_metrics", None)
+            if isinstance(part_metrics, dict):
+                for key, value in part_metrics.items():
+                    metrics[key] = float(value)
+            if hasattr(model_part, "_nanovlm_extra_metrics"):
+                delattr(model_part, "_nanovlm_extra_metrics")
+        return metrics
 
     def _maybe_trace_dataset_batch(
         self,
@@ -800,10 +1003,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # Collect all microbatches on CPU and count total valid tokens
         microbatches = []
         local_valid_tokens = torch.tensor(0, dtype=torch.int64)
+        local_step_effective_tokens = 0
+        local_step_token_capacity = 0
+        last_batch_loss_local: float | None = None
+        last_batch_effective_tokens_local = 0
+        last_batch_token_capacity_local = 0
+
         for _microbatch in range(self.gradient_accumulation_steps):
             input_dict, labels = next(data_iterator)
             local_valid_tokens += (labels != IGNORE_INDEX).sum()
-            microbatches.append((input_dict, labels))
+            data_load_time = (
+                self.metrics_processor.data_loading_times[-1]
+                if self.metrics_processor.data_loading_times
+                else 0.0
+            )
+            microbatches.append((input_dict, labels, data_load_time))
 
         # All-reduce to get global token count across DP ranks
         # Move to GPU for distributed communication
@@ -816,27 +1030,85 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []
-        for microbatch_idx, (input_dict, labels) in enumerate(microbatches, start=1):
+        world_size = (
+            torch.distributed.get_world_size()
+            if torch.distributed.is_initialized()
+            else 1
+        )
+        per_microbatch_stats: list[dict[str, Any]] = []
+        for microbatch_idx, (input_dict, labels, data_load_time) in enumerate(
+            microbatches, start=1
+        ):
+            batch_start_time = time.perf_counter()
             self._maybe_trace_dataset_batch(
                 update_step=self.step,
                 microbatch_idx=microbatch_idx,
                 input_dict=input_dict,
                 labels=labels,
             )
+            if self._is_nanovlm:
+                images = input_dict.get("images")
+                images_per_sample = _extract_images_per_sample(
+                    images,
+                    fallback_batch_size=int(labels.shape[0]) if labels.ndim > 0 else 0,
+                )
+                attention_mask = input_dict.get("attention_mask")
+                if isinstance(attention_mask, torch.Tensor):
+                    batch_effective_tokens = int(attention_mask.sum().item())
+                    batch_token_capacity = int(attention_mask.numel())
+                else:
+                    batch_effective_tokens = int((labels != IGNORE_INDEX).sum().item())
+                    batch_token_capacity = int(labels.numel())
+                local_step_effective_tokens += batch_effective_tokens
+                local_step_token_capacity += batch_token_capacity
+                batch_effective_ratio = _compute_effective_token_ratio(
+                    batch_effective_tokens,
+                    batch_token_capacity,
+                )
+                local_batch_valid_tokens = int((labels != IGNORE_INDEX).sum().item())
+
             # Move tensors to GPU
             for k, v in input_dict.items():
                 if isinstance(v, torch.Tensor):
                     input_dict[k] = v.to(self.device)
             labels = labels.to(self.device)
 
+            fw_bw_start_time = time.perf_counter()
             loss = self.forward_backward_step(
                 input_dict=input_dict,
                 labels=labels,
                 # pyrefly: ignore [bad-argument-type]
                 global_valid_tokens=global_valid_tokens,
             )
+            fw_bw_time = time.perf_counter() - fw_bw_start_time
             accumulated_losses.append(loss.detach())
+            if self._is_nanovlm:
+                if local_batch_valid_tokens > 0 and float(loss.detach().item()) >= 0:
+                    batch_loss_local = (
+                        loss.detach() * global_valid_tokens / local_batch_valid_tokens
+                    ).item()
+                    last_batch_loss_local = float(batch_loss_local)
+                last_batch_effective_tokens_local = batch_effective_tokens
+                last_batch_token_capacity_local = batch_token_capacity
 
+                batch_duration = time.perf_counter() - batch_start_time
+                tokens_per_second = (
+                    float(world_size)
+                    * float(batch_effective_tokens)
+                    / max(batch_duration, 1e-12)
+                )
+                per_microbatch_stats.append(
+                    {
+                        "tokens_per_second": tokens_per_second,
+                        "data_load_time": float(data_load_time),
+                        "fw_bw_time": float(fw_bw_time),
+                        "post_process_time": 0.0,
+                        "effective_token_ratio": float(batch_effective_ratio),
+                        "images_per_sample": images_per_sample,
+                    }
+                )
+
+        post_process_start_time = time.perf_counter()
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in self.model_parts for p in m.parameters()],
             self.config.training.max_norm,
@@ -847,6 +1119,22 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.checkpointer.maybe_wait_for_staging()
         self.optimizers.step()
         self.lr_schedulers.step()
+        post_process_time = time.perf_counter() - post_process_start_time
+        if self._is_nanovlm and per_microbatch_stats:
+            per_microbatch_stats[-1]["post_process_time"] = float(post_process_time)
+        if self._is_nanovlm:
+            self.nanovlm_effective_tokens_seen += local_step_effective_tokens
+            for microbatch_stats in per_microbatch_stats:
+                self._update_nanovlm_training_stats_window(
+                    tokens_per_second=float(microbatch_stats["tokens_per_second"]),
+                    data_load_time=float(microbatch_stats["data_load_time"]),
+                    fw_bw_time=float(microbatch_stats["fw_bw_time"]),
+                    post_process_time=float(microbatch_stats["post_process_time"]),
+                    effective_token_ratio=float(
+                        microbatch_stats["effective_token_ratio"]
+                    ),
+                    images_per_sample=list(microbatch_stats["images_per_sample"]),
+                )
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
@@ -883,15 +1171,96 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             global_avg_loss = global_max_loss = loss.detach().item()
             global_ntokens_seen = self.ntokens_seen
 
+        grad_norm_value = grad_norm.item()
         extra_metrics = {
             "n_tokens_seen": global_ntokens_seen,
             "lr": lr,
         }
+
+        if self._is_nanovlm:
+            if parallel_dims.dp_cp_enabled:
+                nanovlm_consumed_tokens = int(
+                    dist_utils.dist_sum(
+                        torch.tensor(
+                            self.nanovlm_effective_tokens_seen,
+                            dtype=torch.int64,
+                            device=self.device,
+                        ),
+                        loss_mesh,
+                    )
+                )
+            else:
+                nanovlm_consumed_tokens = self.nanovlm_effective_tokens_seen
+
+            step_effective_tokens_global = int(
+                self._dist_reduce_scalar(
+                    float(local_step_effective_tokens),
+                    torch.distributed.ReduceOp.SUM,
+                )
+            )
+            step_token_capacity_global = int(
+                self._dist_reduce_scalar(
+                    float(local_step_token_capacity),
+                    torch.distributed.ReduceOp.SUM,
+                )
+            )
+            batch_effective_tokens_global = int(
+                self._dist_reduce_scalar(
+                    float(last_batch_effective_tokens_local),
+                    torch.distributed.ReduceOp.SUM,
+                )
+            )
+            batch_token_capacity_global = int(
+                self._dist_reduce_scalar(
+                    float(last_batch_token_capacity_local),
+                    torch.distributed.ReduceOp.SUM,
+                )
+            )
+            batch_effective_ratio_global = _compute_effective_token_ratio(
+                batch_effective_tokens_global,
+                batch_token_capacity_global,
+            )
+            step_effective_ratio_global = _compute_effective_token_ratio(
+                step_effective_tokens_global,
+                step_token_capacity_global,
+            )
+
+            batch_loss_sum_global = self._dist_reduce_scalar(
+                float(last_batch_loss_local) if last_batch_loss_local is not None else 0.0,
+                torch.distributed.ReduceOp.SUM,
+            )
+            batch_loss_count_global = self._dist_reduce_scalar(
+                1.0 if last_batch_loss_local is not None else 0.0,
+                torch.distributed.ReduceOp.SUM,
+            )
+            if batch_loss_count_global > 0:
+                batch_loss_global = batch_loss_sum_global / batch_loss_count_global
+            else:
+                batch_loss_global = float(global_avg_loss)
+
+            extra_metrics.update(
+                {
+                    "train/consumed_tokens": nanovlm_consumed_tokens,
+                    "train/batch_loss": batch_loss_global,
+                    "train/batch_effective_tokens": batch_effective_tokens_global,
+                    "train/batch_token_capacity": batch_token_capacity_global,
+                    "train/batch_effective_token_ratio": batch_effective_ratio_global,
+                    "train/step_effective_tokens": step_effective_tokens_global,
+                    "train/step_token_capacity": step_token_capacity_global,
+                    "train/step_effective_token_ratio": step_effective_ratio_global,
+                }
+            )
+            extra_metrics.update(
+                self._build_nanovlm_training_stats_metrics(grad_norm=grad_norm_value)
+            )
+            extra_metrics.update(self._collect_nanovlm_model_extra_metrics())
+            self._reset_nanovlm_training_stats_window()
+
         self.metrics_processor.log(
             self.step,
             global_avg_loss,
             global_max_loss,
-            grad_norm.item(),
+            grad_norm_value,
             extra_metrics=extra_metrics,
         )
 
@@ -977,11 +1346,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         return self.step < self.config.training.steps
 
     def state_dict(self) -> dict[str, Any]:
-        return {"step": self.step, "ntokens_seen": self.ntokens_seen}
+        return {
+            "step": self.step,
+            "ntokens_seen": self.ntokens_seen,
+            "nanovlm_effective_tokens_seen": self.nanovlm_effective_tokens_seen,
+        }
 
     def load_state_dict(self, state_dict: dict[str, Any]):
         self.step = state_dict["step"]
         self.ntokens_seen = state_dict["ntokens_seen"]
+        self.nanovlm_effective_tokens_seen = state_dict.get(
+            "nanovlm_effective_tokens_seen", 0
+        )
 
     def close(self) -> None:
         if hasattr(self, "checkpointer") and self.checkpointer:

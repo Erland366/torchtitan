@@ -77,6 +77,29 @@ Torchtitan reads W&B settings from environment variables:
 - Project: `WANDB_PROJECT`
 - Run name: `WANDB_RUN_NAME`
 
+## Logging Parity Notes
+
+TorchTitan now emits nanoVLM-style train metrics for `nanoVLM` runs in addition
+to the default TorchTitan metrics:
+
+- `train/consumed_tokens` (baseline-style effective non-pad token count)
+- `n_tokens_seen` (TorchTitan raw token-capacity counter)
+- `train/batch_loss` (last microbatch loss at update step, reduced across ranks)
+- `train/batch_effective_tokens`
+- `train/batch_token_capacity`
+- `train/batch_effective_token_ratio`
+- `train/step_effective_tokens`
+- `train/step_token_capacity`
+- `train/step_effective_token_ratio`
+- `training_stats/*` aggregates:
+  - `avg_*` for tokens/s, load/fw-bw/post times, effective token ratio, images/sample
+  - `max_*` and `min_images_per_sample`
+  - optimizer LRs (`lr_mp`, `lr_vision_backbone`, `lr_language_backbone`, etc.)
+  - `training_stats/grad_norm`
+- soft-gating `momh_gate/layer_*/{tt,tv,vt,vv}_mean` metrics from the optimizer hook
+
+`train/step_loss` is intentionally not logged.
+
 ## 100-Step A/B Parity Benchmark
 
 Use the parity benchmark runner to execute `nanoVLM_main` and Torchtitan

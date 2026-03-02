@@ -14,6 +14,27 @@ Each entry should include:
 
 <!-- New entries go above this line -->
 
+## 2026-03-02
+
+- **Date**: 2026-03-02
+- **Type**: Retrospective
+- **General description**: Ran a controlled soft-gating A/B to decide whether startup warmup-discard should remain in TorchTitan parity runs.
+- **Details**:
+  - Executed two 100-step parity runs with identical setup except startup consume behavior:
+    - with skip: `soft-gating-codex-softgating-100step-withskip-20260302-0135`
+    - no skip: `soft-gating-codex-softgating-100step-noskip-20260302-0135`
+  - With-skip pair:
+    - baseline `i76lufb4`, torchtitan `xrxed5z3`
+    - mean abs loss diff `0.0048146`, max `0.19608` (step `14`)
+    - torchtitan peak VRAM `22107 MiB`, median TPS `31015`
+  - No-skip pair:
+    - baseline `elv6513t`, torchtitan `uzxh88t8`
+    - mean abs loss diff `0.0556629`, max `0.35209` (step `5`)
+    - torchtitan peak VRAM `22299 MiB`, median TPS `30496`
+  - Decision:
+    - keep startup warmup-discard enabled for parity-sensitive soft-gating validation.
+    - removing skip was treated as a regression in this controlled A/B.
+
 ## 2026-03-01
 
 - **Date**: 2026-03-01
