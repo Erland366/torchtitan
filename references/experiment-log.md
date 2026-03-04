@@ -14,6 +14,27 @@ Each entry should include:
 
 <!-- New entries go above this line -->
 
+## 2026-03-04
+
+- **Date**: 2026-03-04
+- **Type**: Retrospective
+- **General description**: Documented trainer simplification and parity-run hygiene so shared TorchTitan runtime stays upstream-first without losing reproducibility.
+- **Details**:
+  - Refactored nanoVLM-specific trainer statistics logic into model-local helper:
+    - `torchtitan/models/nanoVLM/trainer_metrics_mixin.py`
+    - shared `torchtitan/trainer.py` now remains closer to upstream structure.
+  - Confirmed short smoke behavior after refactor:
+    - `1 GPU`: wall `64s`, peak `17.03 GiB`
+    - `2 GPU`: wall `58s`, peak `14.49 GiB` per GPU
+    - speedup `1.10x` (2 GPU vs 1 GPU).
+  - Observed startup checkpoint mismatch when reusing output folders across state changes:
+    - error pattern: `Missing key in checkpoint state_dict: dataloader.dp_rank_0.`
+    - resolution: enforce fresh `--dump_folder` per parity run pair.
+  - Retrospective outcomes captured as skill updates:
+    - updated: `torchtitan-upstream-alignment-guardrail`
+    - updated: `torchtitan-dataset-trace-parity-gate`
+    - added: `torchtitan-checkpoint-isolation-parity-runs`
+
 ## 2026-03-02
 
 - **Date**: 2026-03-02

@@ -44,7 +44,15 @@ Do NOT use when:
 
 ## Recommended Practice
 
-### Step 1: Run parity harness with dataset trace enabled
+### Step 1: Run preflight controls before any parity claim
+
+- Always run with a fresh `--dump_folder` to avoid accidental checkpoint resume or
+  state-key mismatch.
+- Log startup consume mode explicitly (`with-skip` or `no-skip`) and compare only
+  runs that use the same mode.
+- Require both baseline and Torchtitan to complete the same step horizon.
+
+### Step 2: Run parity harness with dataset trace enabled
 
 ```bash
 source .venv/bin/activate && \
@@ -56,17 +64,23 @@ python scripts/nanovlm_parity_benchmark.py \
   --run-suffix trace-check
 ```
 
-### Step 2: Check alignment first
+### Step 3: Check alignment first
 
 Read `summary.json` and require all of the following:
 - `dataset_trace.best_alignment.offset == 0`
 - `dataset_trace.best_alignment.exact_matches == dataset_trace.best_alignment.compared_pairs`
 - `dataset_trace.best_alignment.match_ratio == 1.0`
 
-### Step 3: Only then interpret loss differences
+### Step 4: Only then interpret loss differences
 
 If alignment is exact, investigate numeric/runtime causes (compile boundaries, optimizer grouping, clipping semantics).
 If alignment is not exact, prioritize startup/warmup/dataloader alignment before touching model math.
+
+### Step 5: Apply both early-window and full-window gates
+
+- Early-window gate: evaluate strict drift on steps `1-15` to catch startup-sensitive behavior.
+- Full-window gate: evaluate a longer horizon (for example `100` steps) for stability.
+- Treat a run as parity-ready only if both gates pass or both remain within agreed tolerances.
 
 ## Failure Modes
 
@@ -82,10 +96,17 @@ If alignment is not exact, prioritize startup/warmup/dataloader alignment before
 dataset_trace_gate:
   enabled: true
   trace_max_updates: 10
+  preflight:
+    fresh_dump_folder: true
+    require_same_startup_consume_mode: true
+    require_equal_completed_steps: true
   acceptance:
     offset: 0
     exact_match_ratio: 1.0
     require_full_step_pairing: true
+  parity_windows:
+    - early_steps: [1, 15]
+    - full_steps: [1, 100]
 ```
 
 ## References

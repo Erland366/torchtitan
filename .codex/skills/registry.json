@@ -2,7 +2,7 @@
   "domain": "research",
   "version": "1.0.0",
   "created": "2026-02-26",
-  "updated": "2026-03-01",
+  "updated": "2026-03-04",
   "skills": {
     "domain-advisor": {
       "type": "core",
@@ -39,6 +39,10 @@
     "torchtitan-dataset-trace-parity-gate": {
       "type": "result",
       "description": "Require exact microbatch-stream alignment before interpreting loss parity deltas"
+    },
+    "torchtitan-checkpoint-isolation-parity-runs": {
+      "type": "result",
+      "description": "Prevent false parity failures by isolating dump folders and enforcing clean-start A/B runs"
     },
     "vlm-loss-parity-triangulation": {
       "type": "result",

@@ -59,6 +59,18 @@ Keep shared runtime close to upstream and introduce explicit extension points fo
 - Add adapter or hook methods in protocol/model modules.
 - Keep custom checkpoint remapping in model adapter, not checkpoint manager core.
 - Keep model-specific optimizer/LR nuances in model optimizer container/hooks.
+- Keep model-specific metrics/statistics helpers out of `trainer.py` core
+  by moving them to model-local helper modules or mixins under
+  `torchtitan/models/<model_name>/`.
+
+### Step 3: Enforce explicit acceptance checks
+
+- Check that shared trainer changes remain mostly orchestration-level and do not
+  introduce model-specific branches in common runtime loops.
+- Require that model-specific behavior can be disabled by removing the model-local
+  adapter/hook/helper module, without touching shared runtime files.
+- Validate one short run after refactor and confirm no new compile-recompile
+  regressions were introduced.
 
 ## Failure Modes
 
@@ -76,6 +88,8 @@ port_policy:
   acceptance:
     - no_new_model_specific_branches_in_trainer
     - no_new_model_specific_branches_in_checkpoint_manager
+    - trainer_diff_is_orchestration_only
+    - model_metrics_logic_lives_under_models_tree
 ```
 
 ## References
