@@ -1,5 +1,7 @@
 """Paper training configurations for nanoVLM."""
 
+import os
+
 from huggingface_hub import snapshot_download
 
 from torchtitan.components.checkpoint import CheckpointManager
@@ -9,6 +11,7 @@ from torchtitan.config import (
     ActivationCheckpointConfig,
     CompileConfig,
     DebugConfig,
+    ParallelismConfig,
     TrainingConfig,
 )
 from torchtitan.trainer import Trainer
@@ -90,7 +93,7 @@ def nanovlm_230m_structural_gating_finevisionmax_nopack() -> Trainer.Config:
             mp_image_token_length=64,
             tokenizer_name="HuggingFaceTB/SmolLM2-135M-Instruct",
             max_img_size=2048,
-            num_workers=2,
+            num_workers=0,
             pin_memory=True,
             relevance_min_rating=1,
             image_correspondence_min_rating=1,
@@ -357,7 +360,7 @@ def nanovlm_230m_momh_soft_gating_b5_tttv_nopack() -> Trainer.Config:
     """
     ckpt_path = _MOMH_SOFT_GATING_B5_TTTV_CKPT
 
-    return Trainer.Config(
+    cfg = Trainer.Config(
         hf_assets_path=ckpt_path,
         model_spec=model_registry("230m_momh_softgating"),
         tokenizer=None,
@@ -424,3 +427,28 @@ def nanovlm_230m_momh_soft_gating_b5_tttv_nopack() -> Trainer.Config:
         compile=CompileConfig(enable=True, components=["model", "loss"]),
         debug=DebugConfig(seed=0),
     )
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size > 1:
+        # FSDP sharding hangs at optimizer step on this workload. Prefer DDP for
+        # multi-GPU soft-gating runs so the standard launch command remains stable.
+        cfg.parallelism = ParallelismConfig(
+            data_parallel_replicate_degree=world_size,
+            data_parallel_shard_degree=1,
+        )
+        if cfg.checkpoint.folder:
+            cfg.checkpoint.folder = f"{cfg.checkpoint.folder}_ws{world_size}_ddp"
+    return cfg
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_2gpu_ddp() -> Trainer.Config:
+    """2-GPU DDP variant of soft-gating b5 tttv config.
+
+    This avoids the observed optimizer-step hang in FSDP sharded mode for this
+    workload while keeping all model/data/training hyperparameters unchanged.
+    """
+    cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack()
+    cfg.parallelism = ParallelismConfig(
+        data_parallel_replicate_degree=2,
+        data_parallel_shard_degree=1,
+    )
+    return cfg

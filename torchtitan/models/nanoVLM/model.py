@@ -279,6 +279,13 @@ class RotaryEmbedding(nn.Module):
         self, position_ids: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len = position_ids.shape
+        if position_ids.numel() == 0:
+            empty = torch.empty(
+                (batch_size, seq_len, self.dim),
+                device=position_ids.device,
+                dtype=self.inv_freq.dtype,
+            )
+            return empty, empty
         max_seq = position_ids.max() + 1
         if max_seq > self.original_max_seq_len:
             scale = max_seq / self.original_max_seq_len
@@ -385,6 +392,8 @@ class NanoVLMGQAttention(nn.Module):
         is_vision=None,
     ) -> torch.Tensor:
         B, T_curr, C = x.size()
+        if B == 0 or T_curr == 0:
+            return x
 
         q = (
             self.q_proj(x)
@@ -501,7 +510,7 @@ class NanoVLMGQAttention(nn.Module):
             if attention_mask is not None:
                 mask_for_keys = attention_mask[:, :T_kv]
                 additive_attn_mask = (
-                    1.0 - mask_for_keys.unsqueeze(1).unsqueeze(2).float()
+                    1.0 - mask_for_keys.unsqueeze(1).unsqueeze(2).to(dtype=q.dtype)
                 ) * torch.finfo(q.dtype).min
 
             is_causal = T_curr == T_kv and T_curr > 1

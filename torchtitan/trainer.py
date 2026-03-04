@@ -5,7 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import dataclasses
-import hashlib
 import json
 import os
 import time
@@ -43,6 +42,11 @@ from torchtitan.config.configs import (
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.nanoVLM.trainer_metrics_mixin import (
+    compute_effective_token_ratio,
+    extract_images_per_sample,
+    NanoVLMMetricsMixin,
+)
 from torchtitan.protocols import BaseModel
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 from torchtitan.protocols.model_spec import ModelSpec
@@ -54,97 +58,10 @@ from torchtitan.tools.profiling import (
     ProfilingConfig,
 )
 
-PARITY_TRACE_PATH_ENV = "NANOVLM_PARITY_TRACE_PATH"
-PARITY_TRACE_MAX_UPDATES_ENV = "NANOVLM_PARITY_TRACE_MAX_UPDATES"
 
-
-def _flatten_images_for_parity_trace(images: Any) -> torch.Tensor:
-    if isinstance(images, torch.Tensor):
-        return images
-    if not isinstance(images, list):
-        return torch.zeros(0, dtype=torch.float32)
-
-    flat_images: list[torch.Tensor] = []
-    for sample_images in images:
-        if isinstance(sample_images, list):
-            for image in sample_images:
-                if isinstance(image, torch.Tensor):
-                    flat_images.append(image)
-        elif isinstance(sample_images, torch.Tensor):
-            flat_images.append(sample_images)
-
-    if not flat_images:
-        return torch.zeros(0, dtype=torch.float32)
-    if flat_images[0].ndim == 4:
-        return torch.cat(flat_images, dim=0)
-    return torch.stack(flat_images, dim=0)
-
-
-def _tensor_trace_summary(tensor: torch.Tensor | None) -> dict[str, Any]:
-    if tensor is None:
-        return {
-            "shape": [],
-            "dtype": "none",
-            "numel": 0,
-            "hash": "",
-            "sum": 0.0,
-        }
-
-    tensor_cpu = tensor.detach().contiguous()
-    if tensor_cpu.device.type != "cpu":
-        tensor_cpu = tensor_cpu.cpu()
-
-    hash_value = hashlib.sha1(tensor_cpu.numpy().tobytes()).hexdigest()
-    if tensor_cpu.numel() == 0:
-        sum_value = 0.0
-    else:
-        sum_value = float(tensor_cpu.to(torch.float64).sum().item())
-
-    return {
-        "shape": list(tensor_cpu.shape),
-        "dtype": str(tensor_cpu.dtype),
-        "numel": int(tensor_cpu.numel()),
-        "hash": hash_value,
-        "sum": sum_value,
-    }
-
-
-def _max_trace_updates() -> int | None:
-    raw_value = os.getenv(PARITY_TRACE_MAX_UPDATES_ENV, "").strip()
-    if not raw_value:
-        return None
-    return int(raw_value)
-
-
-def _compute_effective_token_ratio(effective_tokens: float, token_capacity: float) -> float:
-    token_capacity_value = float(token_capacity)
-    if token_capacity_value <= 0:
-        raise ValueError("Token capacity must be > 0 when computing effective token ratio.")
-    return float(effective_tokens) / token_capacity_value
-
-
-def _extract_images_per_sample(images: Any, fallback_batch_size: int) -> list[int]:
-    if isinstance(images, list):
-        image_counts: list[int] = []
-        for sample_images in images:
-            if isinstance(sample_images, list):
-                image_counts.append(len(sample_images))
-            elif isinstance(sample_images, torch.Tensor):
-                if sample_images.ndim == 4:
-                    image_counts.append(int(sample_images.shape[0]))
-                else:
-                    image_counts.append(1)
-            else:
-                image_counts.append(0)
-        return image_counts
-
-    if isinstance(images, torch.Tensor) and images.ndim >= 4:
-        return [1 for _ in range(int(images.shape[0]))]
-
-    return [0 for _ in range(max(fallback_batch_size, 0))]
-
-
-class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
+class Trainer(
+    NanoVLMMetricsMixin, torch.distributed.checkpoint.stateful.Stateful, Configurable
+):
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
         """
@@ -626,232 +543,42 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         """
         data_iterator = iter(data_iterable)
 
-        while True:
-            data_load_start = time.perf_counter()
-            try:
-                batch = next(data_iterator)
-            except StopIteration as ex:
-                # If data runs out during gradient accumulation, that
-                # entire step will not be executed.
-                raise DataloaderExhaustedError() from ex
-            input_dict, labels = batch
-            ntokens_batch = labels.numel()
-            self.ntokens_seen += ntokens_batch
-            self.metrics_processor.ntokens_since_last_log += ntokens_batch
-            self.metrics_processor.data_loading_times.append(
-                time.perf_counter() - data_load_start
-            )
+        try:
+            while True:
+                data_load_start = time.perf_counter()
+                try:
+                    batch = next(data_iterator)
+                except StopIteration as ex:
+                    # If data runs out during gradient accumulation, that
+                    # entire step will not be executed.
+                    raise DataloaderExhaustedError() from ex
+                input_dict, labels = batch
+                ntokens_batch = labels.numel()
+                self.ntokens_seen += ntokens_batch
+                self.metrics_processor.ntokens_since_last_log += ntokens_batch
+                self.metrics_processor.data_loading_times.append(
+                    time.perf_counter() - data_load_start
+                )
 
-            # Tensors stay on CPU; moved to GPU per-microbatch during training
-            yield input_dict, labels
+                # Tensors stay on CPU; moved to GPU per-microbatch during training
+                yield input_dict, labels
+        finally:
+            # Explicitly close dataloader iterators. This is important for
+            # streaming datasets in distributed mode to avoid hanging cleanup.
+            dataset_fetcher = getattr(data_iterator, "_dataset_fetcher", None)
+            if dataset_fetcher is not None:
+                dataset_iter = getattr(dataset_fetcher, "dataset_iter", None)
+                dataset_iter_close = getattr(dataset_iter, "close", None)
+                if callable(dataset_iter_close):
+                    dataset_iter_close()
 
-    def _reset_nanovlm_training_stats_window(self) -> None:
-        self._nanovlm_training_stats_window = {
-            "tokens_per_second_sum": 0.0,
-            "tokens_per_second_count": 0,
-            "data_load_time_sum": 0.0,
-            "data_load_time_count": 0,
-            "data_load_time_max": 0.0,
-            "fw_bw_time_sum": 0.0,
-            "fw_bw_time_count": 0,
-            "fw_bw_time_max": 0.0,
-            "post_process_time_sum": 0.0,
-            "post_process_time_count": 0,
-            "post_process_time_max": 0.0,
-            "effective_token_ratio_sum": 0.0,
-            "effective_token_ratio_count": 0,
-            "images_per_sample_sum": 0.0,
-            "images_per_sample_count": 0,
-            "images_per_sample_min": float("inf"),
-            "images_per_sample_max": 0.0,
-        }
+            shutdown_workers = getattr(data_iterator, "_shutdown_workers", None)
+            if callable(shutdown_workers):
+                shutdown_workers()
 
-    def _dist_reduce_scalar(
-        self, value: float, op: torch.distributed.ReduceOp
-    ) -> float:
-        if not torch.distributed.is_initialized():
-            return float(value)
-        reduced = torch.tensor(value, dtype=torch.float64, device=self.device)
-        torch.distributed.all_reduce(reduced, op=op)
-        return float(reduced.item())
-
-    def _update_nanovlm_training_stats_window(
-        self,
-        *,
-        tokens_per_second: float,
-        data_load_time: float,
-        fw_bw_time: float,
-        post_process_time: float,
-        effective_token_ratio: float,
-        images_per_sample: list[int],
-    ) -> None:
-        stats = self._nanovlm_training_stats_window
-        stats["tokens_per_second_sum"] += float(tokens_per_second)
-        stats["tokens_per_second_count"] += 1
-
-        stats["data_load_time_sum"] += float(data_load_time)
-        stats["data_load_time_count"] += 1
-        stats["data_load_time_max"] = max(
-            float(stats["data_load_time_max"]), float(data_load_time)
-        )
-
-        stats["fw_bw_time_sum"] += float(fw_bw_time)
-        stats["fw_bw_time_count"] += 1
-        stats["fw_bw_time_max"] = max(float(stats["fw_bw_time_max"]), float(fw_bw_time))
-
-        stats["post_process_time_sum"] += float(post_process_time)
-        stats["post_process_time_count"] += 1
-        stats["post_process_time_max"] = max(
-            float(stats["post_process_time_max"]), float(post_process_time)
-        )
-
-        stats["effective_token_ratio_sum"] += float(effective_token_ratio)
-        stats["effective_token_ratio_count"] += 1
-
-        if images_per_sample:
-            image_sum = float(sum(images_per_sample))
-            image_count = int(len(images_per_sample))
-            image_min = float(min(images_per_sample))
-            image_max = float(max(images_per_sample))
-            stats["images_per_sample_sum"] += image_sum
-            stats["images_per_sample_count"] += image_count
-            stats["images_per_sample_min"] = min(
-                float(stats["images_per_sample_min"]), image_min
-            )
-            stats["images_per_sample_max"] = max(
-                float(stats["images_per_sample_max"]), image_max
-            )
-
-    def _build_nanovlm_lr_metrics(self) -> dict[str, float]:
-        lr_metrics: dict[str, float] = {}
-        name_map = {
-            "projector": "lr_mp",
-            "vision": "lr_vision_backbone",
-            "lm": "lr_language_backbone",
-        }
-
-        for optimizer in self.optimizers.optimizers:
-            for group_idx, group in enumerate(optimizer.param_groups):
-                group_name = group.get("name")
-                if group_name is None:
-                    group_name = f"group_{group_idx}"
-                metric_name = name_map.get(group_name, group_name)
-                key = f"training_stats/{metric_name}"
-                lr_metrics[key] = float(group["lr"])
-        return lr_metrics
-
-    def _build_nanovlm_training_stats_metrics(self, grad_norm: float) -> dict[str, float]:
-        stats = self._nanovlm_training_stats_window
-        if stats["tokens_per_second_count"] <= 0:
-            return {}
-
-        def _global_mean(sum_key: str, count_key: str) -> float:
-            global_sum = self._dist_reduce_scalar(
-                float(stats[sum_key]),
-                torch.distributed.ReduceOp.SUM,
-            )
-            global_count = self._dist_reduce_scalar(
-                float(stats[count_key]),
-                torch.distributed.ReduceOp.SUM,
-            )
-            if global_count <= 0:
-                return 0.0
-            return global_sum / global_count
-
-        result: dict[str, float] = {
-            "training_stats/avg_tokens_per_second": _global_mean(
-                "tokens_per_second_sum", "tokens_per_second_count"
-            ),
-            "training_stats/avg_data_load_time": _global_mean(
-                "data_load_time_sum", "data_load_time_count"
-            ),
-            "training_stats/avg_fw_bw_time": _global_mean(
-                "fw_bw_time_sum", "fw_bw_time_count"
-            ),
-            "training_stats/avg_post_process_time": _global_mean(
-                "post_process_time_sum", "post_process_time_count"
-            ),
-            "training_stats/avg_effective_token_ratio": _global_mean(
-                "effective_token_ratio_sum", "effective_token_ratio_count"
-            ),
-            "training_stats/avg_images_per_sample": _global_mean(
-                "images_per_sample_sum", "images_per_sample_count"
-            ),
-            "training_stats/max_data_load_time": self._dist_reduce_scalar(
-                float(stats["data_load_time_max"]),
-                torch.distributed.ReduceOp.MAX,
-            ),
-            "training_stats/max_fw_bw_time": self._dist_reduce_scalar(
-                float(stats["fw_bw_time_max"]),
-                torch.distributed.ReduceOp.MAX,
-            ),
-            "training_stats/max_post_process_time": self._dist_reduce_scalar(
-                float(stats["post_process_time_max"]),
-                torch.distributed.ReduceOp.MAX,
-            ),
-            "training_stats/max_images_per_sample": self._dist_reduce_scalar(
-                float(stats["images_per_sample_max"]),
-                torch.distributed.ReduceOp.MAX,
-            ),
-            "training_stats/grad_norm": float(grad_norm),
-        }
-
-        if stats["images_per_sample_count"] > 0:
-            result["training_stats/min_images_per_sample"] = self._dist_reduce_scalar(
-                float(stats["images_per_sample_min"]),
-                torch.distributed.ReduceOp.MIN,
-            )
-
-        result.update(self._build_nanovlm_lr_metrics())
-        return result
-
-    def _collect_nanovlm_model_extra_metrics(self) -> dict[str, float]:
-        metrics: dict[str, float] = {}
-        for model_part in self.model_parts:
-            part_metrics = getattr(model_part, "_nanovlm_extra_metrics", None)
-            if isinstance(part_metrics, dict):
-                for key, value in part_metrics.items():
-                    metrics[key] = float(value)
-            if hasattr(model_part, "_nanovlm_extra_metrics"):
-                delattr(model_part, "_nanovlm_extra_metrics")
-        return metrics
-
-    def _maybe_trace_dataset_batch(
-        self,
-        *,
-        update_step: int,
-        microbatch_idx: int,
-        input_dict: dict[str, torch.Tensor],
-        labels: torch.Tensor,
-        event: str = "train_microbatch",
-    ) -> None:
-        trace_path = os.getenv(PARITY_TRACE_PATH_ENV, "").strip()
-        if not trace_path:
-            return
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
-            return
-
-        max_updates = _max_trace_updates()
-        if max_updates is not None and update_step > max_updates:
-            return
-
-        images = input_dict.get("images")
-        images_tensor = _flatten_images_for_parity_trace(images)
-        row = {
-            "framework": "torchtitan",
-            "event": event,
-            "update_step": int(update_step),
-            "microbatch_idx": int(microbatch_idx),
-            "grad_accum_steps": int(self.gradient_accumulation_steps),
-            "input_ids": _tensor_trace_summary(input_dict.get("input")),
-            "labels": _tensor_trace_summary(labels),
-            "attention_mask": _tensor_trace_summary(input_dict.get("attention_mask")),
-            "images": _tensor_trace_summary(images_tensor),
-            "valid_tokens": int((labels != IGNORE_INDEX).sum().item()),
-        }
-
-        with open(trace_path, "a", encoding="utf-8") as trace_file:
-            trace_file.write(json.dumps(row) + "\n")
+            data_iterator_close = getattr(data_iterator, "close", None)
+            if callable(data_iterator_close):
+                data_iterator_close()
 
     def post_dataloading_process(
         self, input_dict: dict[str, torch.Tensor], labels: torch.Tensor
@@ -1040,15 +767,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             microbatches, start=1
         ):
             batch_start_time = time.perf_counter()
-            self._maybe_trace_dataset_batch(
-                update_step=self.step,
-                microbatch_idx=microbatch_idx,
-                input_dict=input_dict,
-                labels=labels,
-            )
             if self._is_nanovlm:
                 images = input_dict.get("images")
-                images_per_sample = _extract_images_per_sample(
+                images_per_sample = extract_images_per_sample(
                     images,
                     fallback_batch_size=int(labels.shape[0]) if labels.ndim > 0 else 0,
                 )
@@ -1061,7 +782,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     batch_token_capacity = int(labels.numel())
                 local_step_effective_tokens += batch_effective_tokens
                 local_step_token_capacity += batch_token_capacity
-                batch_effective_ratio = _compute_effective_token_ratio(
+                batch_effective_ratio = compute_effective_token_ratio(
                     batch_effective_tokens,
                     batch_token_capacity,
                 )
@@ -1216,11 +937,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     torch.distributed.ReduceOp.SUM,
                 )
             )
-            batch_effective_ratio_global = _compute_effective_token_ratio(
+            batch_effective_ratio_global = compute_effective_token_ratio(
                 batch_effective_tokens_global,
                 batch_token_capacity_global,
             )
-            step_effective_ratio_global = _compute_effective_token_ratio(
+            step_effective_ratio_global = compute_effective_token_ratio(
                 step_effective_tokens_global,
                 step_token_capacity_global,
             )
@@ -1283,58 +1004,59 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 base_folder=config.dump_folder,
             ) as memory_profiler,
         ):
-            if (
-                self.step == 0
-                and self.config.model_spec is not None
-                and self.config.model_spec.name == "nanoVLM"
-            ):
-                # nanoVLM_main warms up workers by consuming one train batch before
-                # entering the optimization loop. Mirror that behavior for parity.
-                raw_data_iterator = iter(self.dataloader)
-                discarded_input_dict, discarded_labels = next(raw_data_iterator)
-                self._maybe_trace_dataset_batch(
-                    update_step=0,
-                    microbatch_idx=0,
-                    input_dict=discarded_input_dict,
-                    labels=discarded_labels,
-                    event="warmup_discard",
+            if self.step == 0 and torch.distributed.is_initialized():
+                logger.info(
+                    "Applying init communication timeout (%ss) to all process groups",
+                    config.comm.init_timeout_seconds,
                 )
-                logger.info("Discarded one startup microbatch to match nanoVLM_main warmup.")
-                data_iterator = self.batch_generator(raw_data_iterator)
-            else:
+                dist_utils.set_pg_timeouts(
+                    timeout=timedelta(seconds=config.comm.init_timeout_seconds),
+                    parallel_dims=self.parallel_dims,
+                )
+
+            data_iterator = None
+            try:
                 data_iterator = self.batch_generator(self.dataloader)
-            while self.should_continue_training():
-                self.step += 1
-                self.gc_handler.run(self.step)
-                try:
-                    self.train_step(data_iterator)
-                except DataloaderExhaustedError:
-                    logger.warning("Ran out of data; last step was canceled.")
-                    break
+                while self.should_continue_training():
+                    self.step += 1
+                    self.gc_handler.run(self.step)
+                    try:
+                        self.train_step(data_iterator)
+                    except DataloaderExhaustedError:
+                        logger.warning("Ran out of data; last step was canceled.")
+                        break
 
-                self.checkpointer.save(
-                    self.step, last_step=(self.step == config.training.steps)
-                )
-
-                # Run validation if validator is available
-                if self.config.validator.enable and self.validator.should_validate(
-                    self.step
-                ):
-                    self.validator.validate(self.model_parts, self.step)
-
-                # signal the profiler that the next profiling step has started
-                if torch_profiler:
-                    torch_profiler.step()
-                if memory_profiler:
-                    memory_profiler.step()
-
-                # reduce timeout after first train step for faster signal
-                # (assuming lazy init and compilation are finished)
-                if self.step == 1:
-                    dist_utils.set_pg_timeouts(
-                        timeout=timedelta(seconds=config.comm.train_timeout_seconds),
-                        parallel_dims=self.parallel_dims,
+                    self.checkpointer.save(
+                        self.step, last_step=(self.step == config.training.steps)
                     )
+
+                    # Run validation if validator is available
+                    if self.config.validator.enable and self.validator.should_validate(
+                        self.step
+                    ):
+                        self.validator.validate(self.model_parts, self.step)
+
+                    # signal the profiler that the next profiling step has started
+                    if torch_profiler:
+                        torch_profiler.step()
+                    if memory_profiler:
+                        memory_profiler.step()
+
+                    # reduce timeout after first train step for faster signal
+                    # (assuming lazy init and compilation are finished)
+                    if self.step == 1:
+                        logger.info(
+                            "Reducing communication timeout to train value (%ss) after first step",
+                            config.comm.train_timeout_seconds,
+                        )
+                        dist_utils.set_pg_timeouts(
+                            timeout=timedelta(seconds=config.comm.train_timeout_seconds),
+                            parallel_dims=self.parallel_dims,
+                        )
+            finally:
+                data_iterator_close = getattr(data_iterator, "close", None)
+                if callable(data_iterator_close):
+                    data_iterator_close()
 
         if torch.distributed.get_rank() == 0:
             logger.info("Sleeping 2 seconds for other ranks to complete")
@@ -1360,6 +1082,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         )
 
     def close(self) -> None:
+        if hasattr(self, "dataloader") and self.dataloader is not None:
+            dataloader_iterator = getattr(self.dataloader, "_iterator", None)
+            if dataloader_iterator is not None:
+                shutdown_workers = getattr(dataloader_iterator, "_shutdown_workers", None)
+                if callable(shutdown_workers):
+                    shutdown_workers()
         if hasattr(self, "checkpointer") and self.checkpointer:
             self.checkpointer.close()
         if hasattr(self, "metrics_processor") and self.metrics_processor:

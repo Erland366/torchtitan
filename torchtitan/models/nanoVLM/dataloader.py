@@ -217,6 +217,7 @@ class VQADataset:
         tokenizer,
         image_processor,
         mp_image_token_length,
+        max_sample_length: int | None = None,
         max_images_per_example=1,
         relevance_min_rating=1,
         image_correspondence_min_rating=1,
@@ -227,6 +228,7 @@ class VQADataset:
         self.tokenizer = tokenizer
         self.image_processor = image_processor
         self.mp_image_token_length = mp_image_token_length
+        self.max_sample_length = max_sample_length
         self.max_images_per_example = max_images_per_example
         self.relevance_min_rating = relevance_min_rating
         self.image_correspondence_min_rating = image_correspondence_min_rating
@@ -252,8 +254,34 @@ class VQADataset:
         return self._process_data(item)
 
     def iter_for_worker(self):
-        for data in self.dataset:
-            yield self._process_data(data)
+        data_iterator = iter(self.dataset)
+        consecutive_fetch_failures = 0
+        try:
+            while True:
+                try:
+                    data = next(data_iterator)
+                    consecutive_fetch_failures = 0
+                except StopIteration:
+                    break
+                except Exception as exc:
+                    consecutive_fetch_failures += 1
+                    logger.warning(
+                        "Streaming dataset fetch failed (%s/%s): %s",
+                        consecutive_fetch_failures,
+                        32,
+                        exc,
+                    )
+                    if consecutive_fetch_failures >= 32:
+                        raise RuntimeError(
+                            "Too many consecutive streaming dataset fetch failures."
+                        ) from exc
+                    continue
+
+                yield self._process_data(data)
+        finally:
+            close_fn = getattr(data_iterator, "close", None)
+            if callable(close_fn):
+                close_fn()
 
     def _process_data(self, item):
         if item["images"] is None:
@@ -283,6 +311,13 @@ class VQADataset:
             return None
 
         input_ids, mask, attention_mask = self._prepare_inputs_and_loss_mask(messages)
+        if (
+            self.max_sample_length is not None
+            and len(input_ids) > int(self.max_sample_length)
+        ):
+            # Filter over-length samples before DataLoader batching to keep
+            # microbatch shapes stable for torch.compile in DDP.
+            return None
         labels = input_ids.clone().masked_fill(~mask, -100)
         labels = labels.roll(-1)
         labels[-1] = -100
@@ -648,6 +683,12 @@ class NanoVLMIterableDataset(IterableDataset, Stateful):
         dp_world_size: int,
     ):
         super().__init__()
+        # Stabilize multi-process streaming reads on this environment.
+        # The hf_transfer/xet fast paths can trigger teardown-time file descriptor
+        # races in distributed streaming jobs.
+        os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
         from datasets import (
             concatenate_datasets,
             get_dataset_config_names,
@@ -658,6 +699,8 @@ class NanoVLMIterableDataset(IterableDataset, Stateful):
 
         self._streaming = streaming
         self._sample_idx = 0
+        self._dp_rank = int(dp_rank)
+        self._dp_world_size = int(dp_world_size)
 
         dataset_names_to_load = list(dataset_name) if dataset_name else ["default"]
         if "shards" in dataset_names_to_load:
@@ -684,9 +727,9 @@ class NanoVLMIterableDataset(IterableDataset, Stateful):
         for config_name in dataset_names_to_load:
             try:
                 ds = _load_train_split(config_name)
-                if streaming:
-                    next(iter(ds))
-                else:
+                if not streaming:
+                    # Keep a lightweight sanity probe for map-style datasets only.
+                    # Probing streaming datasets here can block multi-rank startup.
                     ds[0]
                 loaded_datasets.append(ds)
             except Exception as exc:
@@ -715,10 +758,11 @@ class NanoVLMIterableDataset(IterableDataset, Stateful):
         if not streaming:
             hf_dataset = hf_dataset.shuffle(seed=0)
 
-        if dp_world_size > 1:
+        if dp_world_size > 1 and not streaming:
             hf_dataset = hf_dataset.shard(
                 num_shards=dp_world_size,
                 index=dp_rank,
+                contiguous=False,
             )
 
         self._hf_data = hf_dataset if streaming else None
@@ -728,6 +772,7 @@ class NanoVLMIterableDataset(IterableDataset, Stateful):
             tokenizer,
             image_processor,
             mp_image_token_length,
+            max_sample_length=max_sample_length,
             max_images_per_example=max_images_per_example,
             relevance_min_rating=relevance_min_rating,
             image_correspondence_min_rating=image_correspondence_min_rating,
@@ -751,6 +796,10 @@ class NanoVLMIterableDataset(IterableDataset, Stateful):
             self.packed_dataset = None
 
     def __iter__(self):
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info else 0
+        num_workers = worker_info.num_workers if worker_info else 1
+
         if self.use_packing:
             for sample in self.packed_dataset:
                 self._sample_idx += 1
@@ -758,16 +807,35 @@ class NanoVLMIterableDataset(IterableDataset, Stateful):
                 # DataLoader collate_fn for parity with nanoVLM_main.
                 yield sample
         elif self._streaming:
+            # For streaming datasets, partition by valid-sample index after
+            # VQA filtering. HF iterable sharding partitions data sources and
+            # can drift from 1-GPU sample composition step-by-step.
+            global_valid_sample_idx = 0
             for sample in self.vqa_dataset.iter_for_worker():
                 if sample is None:
+                    continue
+                if (
+                    self._dp_world_size > 1
+                    and (global_valid_sample_idx % self._dp_world_size) != self._dp_rank
+                ):
+                    global_valid_sample_idx += 1
+                    continue
+                dp_local_sample_idx = global_valid_sample_idx // max(self._dp_world_size, 1)
+                global_valid_sample_idx += 1
+                if num_workers > 1 and (dp_local_sample_idx % num_workers) != worker_id:
                     continue
                 self._sample_idx += 1
                 yield sample
         else:
+            worker_sample_idx = 0
             for idx in range(len(self.vqa_dataset)):
                 sample = self.vqa_dataset[idx]
                 if sample is None:
                     continue
+                if num_workers > 1 and (worker_sample_idx % num_workers) != worker_id:
+                    worker_sample_idx += 1
+                    continue
+                worker_sample_idx += 1
                 self._sample_idx += 1
                 yield sample
 
