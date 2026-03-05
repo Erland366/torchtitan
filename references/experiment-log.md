@@ -14,7 +14,76 @@ Each entry should include:
 
 <!-- New entries go above this line -->
 
+## 2026-03-05
+
+- **Date**: 2026-03-05
+- **Type**: Retrospective
+- **General description**: Captured FSDP post-hook collective safety lessons and promoted communication-aware logging as the default soft-gating diagnostics posture.
+- **Details**:
+  - Consolidated 2-GPU FSDP soft-gating benchmark outcomes from `outputs/fsdp_logging_bench_20260305-004638`:
+    - per-step global sync (`soft_b0_global_step`) was the slowest variant (`377s`)
+    - sparse and/or local diagnostics improved runtime (`353-367s`) with unchanged peak VRAM in this matrix.
+  - Codified the root distributed failure mode:
+    - rank-asymmetric DTensor gather in post-step hook (`full_tensor()`) can deadlock NCCL collectives.
+    - robust pattern is all-rank hook execution + local shard reads (`to_local()`) + symmetric `all_reduce` when global metrics are explicitly requested.
+  - Added result skill:
+    - `.codex/skills/torchtitan-fsdp-posthook-collective-safety/SKILL.md`
+  - Updated guardrail skill:
+    - `.codex/skills/torchtitan-upstream-alignment-guardrail/SKILL.md`
+    - now includes explicit "no rank-asymmetric collectives in model hooks" acceptance rule.
+  - Updated skill registry:
+    - `.codex/skills/registry.json` (`updated=2026-03-05`, new skill entry added)
+
+- **Date**: 2026-03-05
+- **Type**: Observation
+- **General description**: Added communication-aware MoMH gate metric modes and benchmarked 2-GPU FSDP soft-gating variants for 100 steps.
+- **Details**:
+  - Implemented optional gate metric controls in nanoVLM model config/hook:
+    - `momh_gate_metrics_enabled` (default `False`)
+    - `momh_gate_metrics_mode` (`local` or `global`)
+    - `momh_gate_metrics_interval` (default `50`)
+  - Added paper config variants for benchmarking:
+    - `..._gating_metrics_global_step`
+    - `..._gating_metrics_local_sparse`
+    - `..._gating_metrics_global_sparse`
+  - FSDP benchmark output:
+    - directory: `outputs/fsdp_logging_bench_20260305-004638`
+    - soft-gating runs all succeeded (`100` steps):
+      - `soft_b0_global_step`: `377s`, peak `15763 MiB`
+      - `soft_b1_off_default`: `367s`, peak `15763 MiB`
+      - `soft_b2_local_sparse`: `358s`, peak `15763 MiB`
+      - `soft_b3_global_sparse`: `353s`, peak `15763 MiB`
+  - Vanilla default config in this environment hit NCCL watchdog timeout before step `50`:
+    - reproduced in standalone rerun (`outputs/fsdp_logging_bench_vanilla_rerun_20260305-011808`)
+    - `_ALLGATHER_BASE` / `ALLREDUCE` timeout with `Timeout(ms)=100000`.
+  - Stabilized vanilla reference run with `--dataloader.num_workers 0`:
+    - directory: `outputs/fsdp_logging_bench_vanilla_nw0_20260305-012517`
+    - `594s`, peak `15665 MiB`, rc `0`.
+
 ## 2026-03-04
+
+- **Date**: 2026-03-04
+- **Type**: Observation
+- **General description**: Fixed the 2-GPU soft-gating FSDP stall by making post-step MoMH metric collection distributed-safe.
+- **Details**:
+  - Reproduced failure with forced FSDP soft-gating:
+    - command: `torchrun --nproc_per_node=2 ... --config nanovlm_230m_momh_soft_gating_b5_tttv_nopack --parallelism.data_parallel_shard_degree 2 --compile.no-enable`
+    - symptom: timeout before `step: 1`.
+    - watchdog stack showed mismatch between:
+      - rank 0 in `models/nanoVLM/hooks.py:_collect_momh_gate_metrics` calling DTensor `full_tensor()` all-gather
+      - rank 1 in trainer reduction all-reduce.
+  - Implemented fix:
+    - `torchtitan/models/nanoVLM/hooks.py`:
+      - run hook on all ranks
+      - use DTensor `to_local()` (no implicit gather)
+      - aggregate gate stats with symmetric `all_reduce`
+      - publish metrics only on rank 0.
+    - `torchtitan/models/nanoVLM/configs/paper.py`:
+      - removed automatic soft-gating world-size-based DDP override.
+  - Validation after patch:
+    - forced FSDP soft-gating (compile off) reaches steps 1-2 and exits cleanly.
+    - default soft-gating 2-GPU launch now resolves to `dp_shard=2` (FSDP) and reaches steps 1-2 cleanly.
+    - vanilla 2-GPU FSDP smoke also passes (steps 1-2).
 
 - **Date**: 2026-03-04
 - **Type**: Retrospective

@@ -69,6 +69,11 @@ Keep shared runtime close to upstream and introduce explicit extension points fo
   introduce model-specific branches in common runtime loops.
 - Require that model-specific behavior can be disabled by removing the model-local
   adapter/hook/helper module, without touching shared runtime files.
+- Enforce distributed safety for model-local hooks:
+  - no rank-asymmetric collectives in hooks that run in training hot paths
+  - if a collective is needed, every participating rank must execute it in identical order
+  - avoid implicit DTensor gathers (`full_tensor()`) in post-step hooks; prefer
+    local shard reads plus explicit symmetric reductions
 - Validate one short run after refactor and confirm no new compile-recompile
   regressions were introduced.
 
@@ -78,6 +83,7 @@ Keep shared runtime close to upstream and introduce explicit extension points fo
 |-------------|-----|----------------|
 | Runtime patched with model-specific key filtering | Shared code became brittle and diverged | Move key adaptation into model adapter hook |
 | Attempted architecture-shape forcing in TorchTitan config | Checkpoint tensor shape mismatches on load | Treat active loaded checkpoint shape as source of truth unless explicitly migrating weights |
+| Rank-asymmetric hook collectives | One rank entered DTensor gather while peers did not, causing NCCL watchdog timeout | Keep hook collectives rank-symmetric and prefer local-shard diagnostics |
 
 ## Configuration
 
@@ -90,6 +96,7 @@ port_policy:
     - no_new_model_specific_branches_in_checkpoint_manager
     - trainer_diff_is_orchestration_only
     - model_metrics_logic_lives_under_models_tree
+    - no_rank_asymmetric_collectives_in_model_hooks
 ```
 
 ## References
