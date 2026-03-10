@@ -18,6 +18,37 @@ Each entry should include:
 
 - **Date**: 2026-03-05
 - **Type**: Retrospective
+- **General description**: Captured the 2-GPU FSDP activation-checkpointing fixed-effective-batch benchmark and distilled model-specific speed/VRAM behavior.
+- **Details**:
+  - Executed fixed-effective-batch benchmark with:
+    - `global_batch_size=64`, `steps=100`, `search_steps=20`, `nproc_per_node=2`
+    - configs: `nanovlm_230m_vanilla_finevisionmax_nopack`, `nanovlm_230m_momh_soft_gating_b5_tttv_nopack`
+    - modes: `activation_checkpoint.mode in {none, full}`
+  - Max feasible local batch:
+    - no AC: `16` (GA `2`) for both configs; local batch `32` OOM in search.
+    - full AC: `32` (GA `1`) for both configs.
+  - Final 100-step outcomes:
+    - vanilla:
+      - no AC: elapsed `499.62s`, peak `29291 MiB`
+      - full AC: elapsed `517.90s`, peak `24807 MiB`
+      - delta: wall-clock slower by `18.28s`, VRAM lower by `4484 MiB`
+    - soft-gating:
+      - no AC: elapsed `384.79s`, peak `29435 MiB`
+      - full AC: elapsed `367.41s`, peak `25071 MiB`
+      - delta: wall-clock faster by `17.38s`, VRAM lower by `4364 MiB`
+  - Operational takeaway:
+    - AC is a reliable VRAM lever and batch-scaling lever at fixed global batch.
+    - speed response is model-dependent (positive for soft-gating, negative for vanilla in this run).
+  - Added report:
+    - `training_reports/torchtitan-fsdp-ac-fixed-global-batch-benchmark-2026-03-05.md`
+  - Added skill:
+    - `.codex/skills/torchtitan-fsdp-ac-effective-batch-tuning/SKILL.md`
+  - Updated skills:
+    - `.codex/skills/torchtitan-vram-gap-triage/SKILL.md`
+    - `.codex/skills/torchtitan-soft-gating-parity-guardrails/SKILL.md`
+
+- **Date**: 2026-03-05
+- **Type**: Retrospective
 - **General description**: Captured FSDP post-hook collective safety lessons and promoted communication-aware logging as the default soft-gating diagnostics posture.
 - **Details**:
   - Consolidated 2-GPU FSDP soft-gating benchmark outcomes from `outputs/fsdp_logging_bench_20260305-004638`:

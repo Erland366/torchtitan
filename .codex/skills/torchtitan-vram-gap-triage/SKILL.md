@@ -39,6 +39,8 @@ Do NOT use when:
 |--------|-------|-------|
 | Earlier observed vanilla gap | +668 MiB | `vanilla-vanilla100-tmux`: Torchtitan `26917 MiB` vs baseline `26249 MiB` |
 | Latest validated vanilla delta | -6254 MiB | `vanilla-vanilla100-vramfix-clean1`: Torchtitan `19995 MiB` vs baseline `26249 MiB` |
+| 2-GPU FSDP AC delta (vanilla) | -4484 MiB | `full` AC vs `none` at fixed global batch `64` |
+| 2-GPU FSDP AC delta (soft-gating) | -4364 MiB | `full` AC vs `none` at fixed global batch `64` |
 | Interpretation | configuration-sensitive | Enforce run-validity checks before drawing VRAM conclusions |
 
 ## Recommended Practice
@@ -61,6 +63,7 @@ Use layered ablations and keep one change per run.
 ### Step 3: Run focused ablations
 
 - `checkpoint.on` vs `checkpoint.off`
+- `activation_checkpoint.mode=none` vs `full` at fixed global batch
 - `metrics.log_freq` changes
 - compile-path changes that keep numerics intact
 - optimizer backend (`foreach` vs `fused`) only if parity remains acceptable
@@ -73,6 +76,7 @@ Use layered ablations and keep one change per run.
 | Treating network-failed runs as memory evidence | Run never entered stable training path | Exclude failed/partial runs from memory conclusions |
 | Changing multiple knobs in one experiment | Impossible attribution | Use one-axis ablations only |
 | Using only framework-reported memory | Misses transient/allocator behavior | Keep external sampler as source of truth for peak memory |
+| Comparing AC modes with different effective batch | Memory/speed conclusions become confounded | Keep global batch fixed and let local batch/GA be the only mode-dependent values |
 
 ## Configuration
 
@@ -99,3 +103,4 @@ awk 'BEGIN{m=0}{if($1>m)m=$1}END{print "MAX_MEM_MIB=" m}' /tmp/run.mem >> /tmp/r
 - Related benchmark summaries:
   - `torchtitan/outputs/nanovlm_parity_benchmarks/vanilla-vanilla100-tmux/summary.json`
   - `torchtitan/outputs/nanovlm_parity_benchmarks/vanilla-vanilla100-vramfix-clean1/summary.json`
+  - `torchtitan/outputs/ac_benchmarks/max-batch-ac-compare-2gpu-20260305-fullplan/summary.json`

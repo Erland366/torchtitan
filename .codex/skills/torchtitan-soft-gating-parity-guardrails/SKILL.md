@@ -66,6 +66,9 @@ For extended checks (100 steps), report both:
 - early window (`steps 1-15`) max/mean deltas,
 - full window (`steps 1-100`) max/mean deltas.
 
+When comparing runtime configurations (for example AC `none` vs `full`), do not use those runs as parity evidence by default.
+Treat AC mode comparisons as performance/memory studies unless they are paired against baseline with full dataset-trace controls.
+
 ### Step 3: Keep performance guardrails in the same report
 
 Never accept a parity fix that regresses the primary goals:
@@ -79,6 +82,7 @@ Never accept a parity fix that regresses the primary goals:
 | Accepting parity without dataset-trace evidence | Loss comparisons were confounded by possible stream skew | Require exact microbatch alignment first |
 | Optimizing only for speed/VRAM | Numeric drift remained hidden | Keep loss acceptance gate mandatory |
 | Changing many axes at once | Could not isolate cause of drift/regression | Run one hypothesis at a time with paired reruns |
+| Using AC-on/off loss deltas as parity verdict | AC-mode A/B is not a baseline-paired parity experiment | Use baseline-vs-Torchtitan paired runs with dataset-trace gate for parity claims |
 
 ## Configuration
 

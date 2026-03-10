@@ -347,6 +347,15 @@ class NanoVLMGQAttention(nn.Module):
         )
         self.momh_causal_gating = getattr(cfg, "momh_causal_gating", False)
         self.momh_soft_gating_pairs = getattr(cfg, "momh_soft_gating_pairs", "all")
+        self.momh_gate_metrics_enabled = bool(
+            getattr(cfg, "momh_gate_metrics_enabled", False)
+        )
+        self.momh_gate_metrics_mode = str(
+            getattr(cfg, "momh_gate_metrics_mode", "local")
+        )
+        self.momh_gate_metrics_interval = int(
+            getattr(cfg, "momh_gate_metrics_interval", 50)
+        )
         self.momh_soft_gating = getattr(cfg, "momh_soft_gating", False)
         if self.momh_soft_gating:
             self.momh_gate = nn.Parameter(torch.zeros(self.n_heads, 4))
@@ -621,6 +630,14 @@ class NanoVLMModel(BaseModel):
         momh_soft_gating_pairs: str = "all"
         momh_structural_mask_only: bool = False
         momh_causal_gating: bool = False
+        # Optional soft-gating diagnostics. Keep disabled by default to avoid
+        # extra distributed communication overhead in the training hot path.
+        momh_gate_metrics_enabled: bool = False
+        # `local`: rank-local values only (no cross-rank collectives)
+        # `global`: cross-rank synchronized values
+        momh_gate_metrics_mode: str = "local"
+        # Hook collection interval in optimizer steps when enabled.
+        momh_gate_metrics_interval: int = 50
 
         # Identity (set during build from tokenizer)
         image_token_id: int = -1
@@ -631,6 +648,17 @@ class NanoVLMModel(BaseModel):
             if dl_config is not None and hasattr(dl_config, "image_token_id"):
                 if dl_config.image_token_id > 0:
                     self.image_token_id = dl_config.image_token_id
+
+            if self.momh_gate_metrics_mode not in {"local", "global"}:
+                raise ValueError(
+                    "momh_gate_metrics_mode must be one of {'local', 'global'}, "
+                    f"got {self.momh_gate_metrics_mode!r}"
+                )
+            if self.momh_gate_metrics_interval <= 0:
+                raise ValueError(
+                    "momh_gate_metrics_interval must be > 0, "
+                    f"got {self.momh_gate_metrics_interval}"
+                )
 
         def get_nparams_and_flops(
             self, model: Module, seq_len: int

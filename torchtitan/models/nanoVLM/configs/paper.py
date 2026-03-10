@@ -1,6 +1,6 @@
 """Paper training configurations for nanoVLM."""
 
-import os
+import dataclasses
 
 from huggingface_hub import snapshot_download
 
@@ -27,6 +27,16 @@ _MOMH_SOFT_GATING_B5_TTTV_CKPT = (
     "SmolLM2-135M-Instruct_2xGPU_bs128_1000_lr_vision_0.0-language_1e-05-5e-05_"
     "0217-185054/uptraining-result"
 )
+
+
+def _with_model_overrides(
+    cfg: Trainer.Config,
+    **model_overrides,
+) -> Trainer.Config:
+    """Clone model spec with overridden model-config fields."""
+    model_cfg = dataclasses.replace(cfg.model_spec.model, **model_overrides)
+    cfg.model_spec = dataclasses.replace(cfg.model_spec, model=model_cfg)
+    return cfg
 
 
 def _resolve_hf_repo(repo_id: str) -> str:
@@ -427,25 +437,44 @@ def nanovlm_230m_momh_soft_gating_b5_tttv_nopack() -> Trainer.Config:
         compile=CompileConfig(enable=True, components=["model", "loss"]),
         debug=DebugConfig(seed=0),
     )
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size > 1:
-        # FSDP sharding hangs at optimizer step on this workload. Prefer DDP for
-        # multi-GPU soft-gating runs so the standard launch command remains stable.
-        cfg.parallelism = ParallelismConfig(
-            data_parallel_replicate_degree=world_size,
-            data_parallel_shard_degree=1,
-        )
-        if cfg.checkpoint.folder:
-            cfg.checkpoint.folder = f"{cfg.checkpoint.folder}_ws{world_size}_ddp"
     return cfg
 
 
-def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_2gpu_ddp() -> Trainer.Config:
-    """2-GPU DDP variant of soft-gating b5 tttv config.
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_gating_metrics_global_step() -> Trainer.Config:
+    """Soft-gating config with globally synchronized gate metrics every step."""
+    cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack()
+    return _with_model_overrides(
+        cfg,
+        momh_gate_metrics_enabled=True,
+        momh_gate_metrics_mode="global",
+        momh_gate_metrics_interval=1,
+    )
 
-    This avoids the observed optimizer-step hang in FSDP sharded mode for this
-    workload while keeping all model/data/training hyperparameters unchanged.
-    """
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_gating_metrics_local_sparse() -> Trainer.Config:
+    """Soft-gating config with local (no cross-rank sync) gate metrics every 50 steps."""
+    cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack()
+    return _with_model_overrides(
+        cfg,
+        momh_gate_metrics_enabled=True,
+        momh_gate_metrics_mode="local",
+        momh_gate_metrics_interval=50,
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_gating_metrics_global_sparse() -> Trainer.Config:
+    """Soft-gating config with globally synchronized gate metrics every 50 steps."""
+    cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack()
+    return _with_model_overrides(
+        cfg,
+        momh_gate_metrics_enabled=True,
+        momh_gate_metrics_mode="global",
+        momh_gate_metrics_interval=50,
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_2gpu_ddp() -> Trainer.Config:
+    """2-GPU DDP variant of soft-gating b5 tttv config."""
     cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack()
     cfg.parallelism = ParallelismConfig(
         data_parallel_replicate_degree=2,

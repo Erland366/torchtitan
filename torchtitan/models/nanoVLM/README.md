@@ -100,6 +100,29 @@ to the default TorchTitan metrics:
 
 `train/step_loss` is intentionally not logged.
 
+### Optional MoMH gate metric communication
+
+For soft-gating, MoMH gate metrics now support communication-aware modes:
+
+- `momh_gate_metrics_enabled` (default `False`)
+- `momh_gate_metrics_mode`:
+  - `"local"`: rank-local gate statistics only (no cross-rank collectives)
+  - `"global"`: synchronized gate statistics across ranks
+- `momh_gate_metrics_interval` (default `50` optimizer steps)
+
+These fields live in `NanoVLMModel.Config` and are exposed by paper config
+variants:
+
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack` (default: disabled)
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_gating_metrics_global_step`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_gating_metrics_local_sparse`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_gating_metrics_global_sparse`
+
+Operational guidance:
+- keep gate metrics disabled for throughput-focused FSDP runs
+- use local sparse mode for low-overhead diagnostics
+- use global mode only when exact all-rank gate means are required
+
 ## 100-Step A/B Parity Benchmark
 
 Use the parity benchmark runner to execute `nanoVLM_main` and Torchtitan
