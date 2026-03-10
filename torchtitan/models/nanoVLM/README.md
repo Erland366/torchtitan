@@ -69,6 +69,21 @@ The paper configs now use config-specific checkpoint folders and keep final save
 native DCP format (`last_save_in_hf=False`) so training resume behavior stays
 consistent.
 
+## HF Export Compatibility Notes
+
+When exporting nanoVLM checkpoints from TorchTitan to HF/nanoVLM safetensors:
+
+- RoPE `inv_freq` is exported as `decoder.rotary_embd.inv_freq` for compatibility
+  with nanoVLM strict local loading.
+- Tied LM embeddings are exported using a single canonical key
+  (`decoder.head.weight`). `decoder.token_embedding.weight` is intentionally not
+  duplicated in tied mode, because nanoVLM strict loading can treat that alias as
+  an unexpected key.
+- `scripts/checkpoint_conversion/convert_to_hf.py --model_name nanoVLM ...` now
+  emits `config.json` and `model.safetensors` directly in the output folder, so
+  `nanoVLM_main/evaluation.py --mode nanovlm --model <output_dir>` works without
+  manual file patching.
+
 ## W&B Env Vars
 
 Torchtitan reads W&B settings from environment variables:
@@ -178,7 +193,7 @@ TorchTitan.
 ### Quickstart
 
 ```bash
-source ../nanoVLM_main/.venv/bin/activate
+source .venv/bin/activate
 cd /home/coder/edd/nanoVLM_root/torchtitan
 
 CKPT_PATH=/abs/path/to/checkpoint_folder ./evaluation_torchtitan.sh
@@ -202,7 +217,7 @@ Produced artifacts:
 Main script:
 
 ```bash
-source ../nanoVLM_main/.venv/bin/activate
+source .venv/bin/activate
 cd /home/coder/edd/nanoVLM_root/torchtitan
 
 python scripts/nanovlm_downstream_eval.py \
@@ -218,8 +233,10 @@ python scripts/nanovlm_downstream_eval.py \
 
 Behavior:
 - tries raw lmms-eval backend first (`--model_backend`, default `huggingface`)
-- if raw load/eval fails and fallback is enabled, uses a thin TorchTitan
-  registration (`torchtitan_nanovlm`) that reuses nanoVLM wrapper behavior
+- if raw load/eval fails and fallback is enabled, uses a TorchTitan-local
+  registration (`torchtitan_nanovlm`) implemented in `torchtitan.eval`
+- fallback backend uses prefill-once + KV-cache decode in eval runtime to avoid
+  full-sequence recomputation each generated token
 - records attempt outcomes and chosen backend in `metadata.json`
 
 ### DCP Checkpoints

@@ -59,6 +59,26 @@ from torchtitan.tools.profiling import (
 )
 
 
+def _compute_effective_token_ratio(
+    effective_tokens: float, token_capacity: float
+) -> float:
+    if float(token_capacity) <= 0:
+        raise ValueError("token_capacity must be positive")
+    return compute_effective_token_ratio(effective_tokens, token_capacity)
+
+
+_extract_images_per_sample = extract_images_per_sample
+
+
+@dataclass(slots=True)
+class _NanoVLMMicrobatchStats:
+    images_per_sample: list[int]
+    effective_tokens: int
+    token_capacity: int
+    effective_ratio: float
+    valid_tokens: int
+
+
 class Trainer(
     NanoVLMMetricsMixin, torch.distributed.checkpoint.stateful.Stateful, Configurable
 ):
@@ -650,6 +670,35 @@ class Trainer(
 
         return inputs, labels, extra_inputs, extra_kwargs
 
+    def _build_nanovlm_microbatch_stats(
+        self,
+        input_dict: dict[str, torch.Tensor],
+        labels: torch.Tensor,
+    ) -> _NanoVLMMicrobatchStats:
+        images = input_dict.get("images")
+        images_per_sample = extract_images_per_sample(
+            images,
+            fallback_batch_size=int(labels.shape[0]) if labels.ndim > 0 else 0,
+        )
+        attention_mask = input_dict.get("attention_mask")
+        if isinstance(attention_mask, torch.Tensor):
+            effective_tokens = int(attention_mask.sum().item())
+            token_capacity = int(attention_mask.numel())
+        else:
+            effective_tokens = int((labels != IGNORE_INDEX).sum().item())
+            token_capacity = int(labels.numel())
+
+        return _NanoVLMMicrobatchStats(
+            images_per_sample=images_per_sample,
+            effective_tokens=effective_tokens,
+            token_capacity=token_capacity,
+            effective_ratio=compute_effective_token_ratio(
+                effective_tokens,
+                token_capacity,
+            ),
+            valid_tokens=int((labels != IGNORE_INDEX).sum().item()),
+        )
+
     def forward_backward_step(
         self,
         *,
@@ -767,26 +816,11 @@ class Trainer(
             microbatches, start=1
         ):
             batch_start_time = time.perf_counter()
+            nanovlm_stats: _NanoVLMMicrobatchStats | None = None
             if self._is_nanovlm:
-                images = input_dict.get("images")
-                images_per_sample = extract_images_per_sample(
-                    images,
-                    fallback_batch_size=int(labels.shape[0]) if labels.ndim > 0 else 0,
-                )
-                attention_mask = input_dict.get("attention_mask")
-                if isinstance(attention_mask, torch.Tensor):
-                    batch_effective_tokens = int(attention_mask.sum().item())
-                    batch_token_capacity = int(attention_mask.numel())
-                else:
-                    batch_effective_tokens = int((labels != IGNORE_INDEX).sum().item())
-                    batch_token_capacity = int(labels.numel())
-                local_step_effective_tokens += batch_effective_tokens
-                local_step_token_capacity += batch_token_capacity
-                batch_effective_ratio = compute_effective_token_ratio(
-                    batch_effective_tokens,
-                    batch_token_capacity,
-                )
-                local_batch_valid_tokens = int((labels != IGNORE_INDEX).sum().item())
+                nanovlm_stats = self._build_nanovlm_microbatch_stats(input_dict, labels)
+                local_step_effective_tokens += nanovlm_stats.effective_tokens
+                local_step_token_capacity += nanovlm_stats.token_capacity
 
             # Move tensors to GPU
             for k, v in input_dict.items():
@@ -803,19 +837,19 @@ class Trainer(
             )
             fw_bw_time = time.perf_counter() - fw_bw_start_time
             accumulated_losses.append(loss.detach())
-            if self._is_nanovlm:
-                if local_batch_valid_tokens > 0 and float(loss.detach().item()) >= 0:
+            if nanovlm_stats is not None:
+                if nanovlm_stats.valid_tokens > 0 and float(loss.detach().item()) >= 0:
                     batch_loss_local = (
-                        loss.detach() * global_valid_tokens / local_batch_valid_tokens
+                        loss.detach() * global_valid_tokens / nanovlm_stats.valid_tokens
                     ).item()
                     last_batch_loss_local = float(batch_loss_local)
-                last_batch_effective_tokens_local = batch_effective_tokens
-                last_batch_token_capacity_local = batch_token_capacity
+                last_batch_effective_tokens_local = nanovlm_stats.effective_tokens
+                last_batch_token_capacity_local = nanovlm_stats.token_capacity
 
                 batch_duration = time.perf_counter() - batch_start_time
                 tokens_per_second = (
                     float(world_size)
-                    * float(batch_effective_tokens)
+                    * float(nanovlm_stats.effective_tokens)
                     / max(batch_duration, 1e-12)
                 )
                 per_microbatch_stats.append(
@@ -824,8 +858,8 @@ class Trainer(
                         "data_load_time": float(data_load_time),
                         "fw_bw_time": float(fw_bw_time),
                         "post_process_time": 0.0,
-                        "effective_token_ratio": float(batch_effective_ratio),
-                        "images_per_sample": images_per_sample,
+                        "effective_token_ratio": float(nanovlm_stats.effective_ratio),
+                        "images_per_sample": nanovlm_stats.images_per_sample,
                     }
                 )
 

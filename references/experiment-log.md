@@ -14,6 +14,25 @@ Each entry should include:
 
 <!-- New entries go above this line -->
 
+## 2026-03-11
+
+- **Date**: 2026-03-11
+- **Type**: Retrospective
+- **General description**: Hardened TorchTitan nanoVLM export and eval compatibility so converted checkpoints load directly in `nanoVLM_main` and preserved `mmstar` parity.
+- **Details**:
+  - Export compatibility fixes:
+    - `torchtitan/models/nanoVLM/state_dict_adapter.py` now exports `decoder.rotary_embd.inv_freq`.
+    - tied LM embeddings remain canonical (`decoder.head.weight` only) to avoid strict-load alias mismatches.
+    - `scripts/checkpoint_conversion/convert_to_hf.py` now emits `config.json` and `model.safetensors` directly for `--model_name nanoVLM`.
+  - Validation:
+    - fresh converted checkpoints loaded directly via `nanoVLM_main/evaluation.py --mode nanovlm`.
+    - `mmstar` parity confirmed on `limit=20` between TorchTitan eval and nanoVLM eval (`average,none = 0.4375`).
+  - Runtime cleanup:
+    - kept standalone TorchTitan eval backend with cached KV decode path.
+    - simplified local helper structure in eval/export/runtime code and restored trainer helper compatibility for unit tests.
+  - Known limitation:
+    - raw `huggingface` downstream eval still falls back to `torchtitan_nanovlm` for these checkpoint folders; correctness is fine, but generic raw backend support is still incomplete.
+
 ## 2026-03-10
 
 - **Date**: 2026-03-10

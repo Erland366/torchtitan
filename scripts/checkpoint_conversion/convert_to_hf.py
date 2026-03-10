@@ -6,6 +6,9 @@
 
 import argparse
 import importlib
+import json
+import shutil
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -13,6 +16,85 @@ import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint import HuggingFaceStorageWriter
 from torchtitan.components.checkpoint import ModelWrapper
 from torchtitan.config import TORCH_DTYPE_MAP
+
+_NANOVLM_CONFIG_PASSTHROUGH_FIELDS = (
+    "vit_hidden_dim",
+    "vit_inter_dim",
+    "vit_patch_size",
+    "vit_img_size",
+    "vit_n_heads",
+    "vit_n_blocks",
+    "vit_ln_eps",
+    "vit_cls_flag",
+    "vit_dropout",
+    "lm_hidden_dim",
+    "lm_inter_dim",
+    "lm_rms_eps",
+    "lm_re_base",
+    "lm_max_position_embeddings",
+    "lm_vocab_size",
+    "lm_n_heads",
+    "lm_n_kv_heads",
+    "lm_n_blocks",
+    "lm_attn_scaling",
+    "lm_tie_weights",
+    "lm_dropout",
+    "mp_pixel_shuffle_factor",
+    "mp_image_token_length",
+    "momh_enabled",
+    "momh_kv_groups_vision",
+    "momh_kv_groups_text",
+    "momh_soft_gating",
+    "momh_soft_gating_init",
+    "momh_soft_gating_pairs",
+    "momh_structural_mask_only",
+    "momh_causal_gating",
+)
+
+
+def _config_as_dict(model_config) -> dict:
+    if hasattr(model_config, "__dataclass_fields__"):
+        return asdict(model_config)
+    return dict(model_config)
+
+
+def _nanovlm_model_config_to_vlm_config(model_config) -> dict:
+    """Map TorchTitan nanoVLM config fields to nanoVLM_main VLMConfig fields."""
+    cfg = _config_as_dict(model_config)
+
+    vlm_cfg = {
+        field: cfg[field]
+        for field in _NANOVLM_CONFIG_PASSTHROUGH_FIELDS
+        if field in cfg
+    }
+
+    if "lm_max_position_embeddings" in cfg:
+        vlm_cfg["lm_max_length"] = cfg["lm_max_position_embeddings"]
+
+    vlm_cfg.setdefault("lm_use_tokens", False)
+    vlm_cfg.setdefault("lm_base_vocab_size", 49152)
+    vlm_cfg.setdefault("extra_token_amount", cfg.get("lm_vocab_size", 49218) - 49152)
+    return vlm_cfg
+
+
+def _emit_nanovlm_bundle(output_dir: Path, model_config) -> None:
+    """Emit nanoVLM_main-compatible files (config.json + model.safetensors)."""
+    config_path = output_dir / "config.json"
+    config_path.write_text(
+        json.dumps(_nanovlm_model_config_to_vlm_config(model_config), indent=4),
+        encoding="utf-8",
+    )
+
+    single_file = output_dir / "model.safetensors"
+    shard_files = sorted(output_dir.glob("model-*.safetensors"))
+    if single_file.exists():
+        return
+    if len(shard_files) != 1:
+        raise RuntimeError(
+            "nanoVLM bundle emission expects a single consolidated shard. "
+            f"Found {len(shard_files)} shard files under '{output_dir}'."
+        )
+    shutil.copyfile(shard_files[0], single_file)
 
 
 @torch.inference_mode()
@@ -66,6 +148,9 @@ def convert_to_hf(
         hf_state_dict,
         storage_writer=storage_writer,
     )
+
+    if model_name == "nanoVLM":
+        _emit_nanovlm_bundle(Path(output_dir), model_config)
 
 
 if __name__ == "__main__":

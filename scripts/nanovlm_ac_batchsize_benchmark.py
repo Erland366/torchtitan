@@ -495,8 +495,8 @@ def main() -> int:
     parser.add_argument(
         "--venv-activate",
         type=Path,
-        default=Path("../nanoVLM_main/.venv/bin/activate"),
-        help="Path to shared virtualenv activate script.",
+        default=None,
+        help="Path to virtualenv activate script (default: <torchtitan-root>/.venv/bin/activate).",
     )
     parser.add_argument(
         "--output-dir",
@@ -538,7 +538,11 @@ def main() -> int:
         raise ValueError("--modes must include at least one mode.")
 
     torchtitan_root = args.torchtitan_root.resolve()
-    activate_path = args.venv_activate.resolve()
+    activate_path = (
+        args.venv_activate.resolve()
+        if args.venv_activate is not None
+        else (torchtitan_root / ".venv" / "bin" / "activate")
+    )
     if not activate_path.exists():
         raise FileNotFoundError(f"Missing venv activate script: {activate_path}")
 

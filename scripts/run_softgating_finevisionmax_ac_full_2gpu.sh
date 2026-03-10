@@ -7,7 +7,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TORCHTITAN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-VENV_ACTIVATE="${VENV_ACTIVATE:-/home/coder/edd/nanoVLM_root/nanoVLM_main/.venv/bin/activate}"
+VENV_ACTIVATE="${VENV_ACTIVATE:-${TORCHTITAN_ROOT}/.venv/bin/activate}"
 
 CONFIG_NAME="${CONFIG_NAME:-nanovlm_230m_momh_soft_gating_b5_tttv_nopack}"
 STEPS="${STEPS:-100}"
@@ -17,6 +17,12 @@ GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-2}"
 GLOBAL_BATCH_SIZE=$(( LOCAL_BATCH_SIZE * NPROC_PER_NODE * GRAD_ACCUM_STEPS ))
 COMM_INIT_TIMEOUT_SECONDS="${COMM_INIT_TIMEOUT_SECONDS:-1800}"
 COMM_TRAIN_TIMEOUT_SECONDS="${COMM_TRAIN_TIMEOUT_SECONDS:-300}"
+
+if [[ ! -f "${VENV_ACTIVATE}" ]]; then
+  echo "Missing virtualenv activation script: ${VENV_ACTIVATE}" >&2
+  echo "Set VENV_ACTIVATE to your torchtitan virtualenv activate path." >&2
+  exit 1
+fi
 
 source "${VENV_ACTIVATE}"
 cd "${TORCHTITAN_ROOT}"

@@ -43,7 +43,11 @@ class NanoVLMStateDictAdapter(BaseStateDictAdapter):
 
         Skipped keys:
             vision_encoder.layers.*  — alias of vision_encoder.blocks (duplicates)
-            rotary_embd.inv_freq     — recomputed on load
+
+        Notes:
+            rotary_embd.inv_freq is now exported as
+            decoder.rotary_embd.inv_freq for compatibility with nanoVLM
+            strict safetensors loading.
         """
         hf_sd: dict[str, Any] = {}
 
@@ -55,8 +59,11 @@ class NanoVLMStateDictAdapter(BaseStateDictAdapter):
             # Skip the nn.ModuleDict alias (layers == blocks for vision encoder)
             if key.startswith("vision_encoder.layers."):
                 continue
-            # Skip rotary embedding buffer (recomputed on load)
+            # Export RoPE inv_freq buffer for strict nanoVLM loaders.
+            # TorchTitan can recompute this buffer, but nanoVLM local
+            # from_pretrained() expects it in model.safetensors.
             if key == "rotary_embd.inv_freq":
+                hf_sd["decoder.rotary_embd.inv_freq"] = tensor
                 continue
             # Skip MoMH soft-gating params (not present in vanilla checkpoints).
             if ".momh_gate" in key:
@@ -66,8 +73,11 @@ class NanoVLMStateDictAdapter(BaseStateDictAdapter):
             tie_weights = getattr(self.model_config, "lm_tie_weights", True)
             if key == "tok_embeddings.weight":
                 if tie_weights:
-                    # Tied weights: checkpoint only has decoder.head.weight,
-                    # so emit only that key to match what dcp.load() will find.
+                    # Tied weights: emit only one canonical key.
+                    # Adding both decoder.head.weight and
+                    # decoder.token_embedding.weight causes strict nanoVLM
+                    # loading to flag decoder.token_embedding.weight as
+                    # unexpected because the model stores this alias only once.
                     hf_sd["decoder.head.weight"] = tensor
                 else:
                     hf_sd["decoder.token_embedding.weight"] = tensor

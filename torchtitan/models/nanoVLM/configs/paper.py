@@ -1,6 +1,7 @@
 """Paper training configurations for nanoVLM."""
 
 import dataclasses
+import os
 
 from huggingface_hub import snapshot_download
 
@@ -21,12 +22,7 @@ from ..dataloader import NanoVLMDataLoader
 from ..optimizer import NanoVLMOptimizersContainer
 
 _NANOVLM_230M_REPO = "lusxvr/nanoVLM-230M-8k"
-_MOMH_SOFT_GATING_B5_TTTV_CKPT = (
-    "/home/coder/edd/nanoVLM_root/nanoVLM_main/checkpoints/"
-    "momh-gqa-uptrain-paper-a05-pack_nanoVLM_siglip2-base-patch16-512_2048_mp4_"
-    "SmolLM2-135M-Instruct_2xGPU_bs128_1000_lr_vision_0.0-language_1e-05-5e-05_"
-    "0217-185054/uptraining-result"
-)
+_MOMH_SOFT_GATING_B5_TTTV_CKPT_ENV = "NANOVLM_SOFT_GATING_INIT_CKPT"
 
 
 def _with_model_overrides(
@@ -42,6 +38,18 @@ def _with_model_overrides(
 def _resolve_hf_repo(repo_id: str) -> str:
     """Resolve an HF repo ID to a local cache directory."""
     return snapshot_download(repo_id)
+
+
+def _resolve_soft_gating_base_checkpoint() -> str:
+    """Resolve soft-gating init checkpoint path without cross-repo dependency.
+
+    If NANOVLM_SOFT_GATING_INIT_CKPT is set, use it directly. Otherwise,
+    default to the public nanoVLM-230M-8k HuggingFace checkpoint.
+    """
+    override = os.getenv(_MOMH_SOFT_GATING_B5_TTTV_CKPT_ENV, "").strip()
+    if override:
+        return override
+    return _resolve_hf_repo(_NANOVLM_230M_REPO)
 
 
 def nanovlm_230m_structural_gating_finevisionmax_nopack() -> Trainer.Config:
@@ -368,7 +376,7 @@ def nanovlm_230m_momh_soft_gating_b5_tttv_nopack() -> Trainer.Config:
     Ported from:
       nanoVLM_main/configs/train.paper.momh.soft-gating-b5-tttv.nopack.yaml
     """
-    ckpt_path = _MOMH_SOFT_GATING_B5_TTTV_CKPT
+    ckpt_path = _resolve_soft_gating_base_checkpoint()
 
     cfg = Trainer.Config(
         hf_assets_path=ckpt_path,
