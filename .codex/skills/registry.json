@@ -52,6 +52,10 @@
       "type": "result",
       "description": "Select activation checkpointing mode by fixed-global-batch max-batch search and 100-step wall-clock/VRAM evidence"
     },
+    "torchtitan-downstream-eval-raw-first-fallback": {
+      "type": "result",
+      "description": "Run downstream eval with raw lmms backend first and deterministic TorchTitan plugin fallback when local checkpoints are not full HF bundles"
+    },
     "vlm-loss-parity-triangulation": {
       "type": "result",
       "description": "Protocol to isolate loss mismatch after speed/VRAM goals are already satisfied"

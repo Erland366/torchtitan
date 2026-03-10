@@ -168,3 +168,62 @@ python scripts/nanovlm_parity_benchmark.py \
   --wandb-entity patrickirawan-mbzuai \
   --wandb-project momh
 ```
+
+## Manual Downstream Evaluation (TorchTitan)
+
+TorchTitan now has a manual downstream eval entrypoint mirroring the
+`nanoVLM_main/evaluation.sh` ergonomics while keeping checkpoint handling in
+TorchTitan.
+
+### Quickstart
+
+```bash
+source ../nanoVLM_main/.venv/bin/activate
+cd /home/coder/edd/nanoVLM_root/torchtitan
+
+CKPT_PATH=/abs/path/to/checkpoint_folder ./evaluation_torchtitan.sh
+```
+
+Defaults:
+- tasks: `coco2017_cap_val,vqav2_val,ocrbench,scienceqa,docvqa_val`
+- limit: `2000`
+- batch size: `16`
+- raw backend: `huggingface`
+- fallback backend: `torchtitan_plugin`
+- outputs: `eval_results/torchtitan/<run_name>/`
+
+Produced artifacts:
+- `summary.json`
+- `per_task.json`
+- `metadata.json`
+
+### Raw-first with explicit fallback
+
+Main script:
+
+```bash
+source ../nanoVLM_main/.venv/bin/activate
+cd /home/coder/edd/nanoVLM_root/torchtitan
+
+python scripts/nanovlm_downstream_eval.py \
+  --checkpoint_path /abs/path/to/checkpoint \
+  --checkpoint_format auto \
+  --tasks mmstar \
+  --limit 100 \
+  --batch_size 8 \
+  --model_backend huggingface \
+  --fallback_backend torchtitan_plugin \
+  --output_dir eval_results/torchtitan
+```
+
+Behavior:
+- tries raw lmms-eval backend first (`--model_backend`, default `huggingface`)
+- if raw load/eval fails and fallback is enabled, uses a thin TorchTitan
+  registration (`torchtitan_nanovlm`) that reuses nanoVLM wrapper behavior
+- records attempt outcomes and chosen backend in `metadata.json`
+
+### DCP Checkpoints
+
+If checkpoint format resolves to DCP, the script converts to HF format first
+using `scripts/checkpoint_conversion/convert_to_hf.py` and then evaluates.
+Use `--keep_converted` to retain the intermediate converted folder.

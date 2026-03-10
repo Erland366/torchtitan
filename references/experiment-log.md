@@ -14,6 +14,27 @@ Each entry should include:
 
 <!-- New entries go above this line -->
 
+## 2026-03-10
+
+- **Date**: 2026-03-10
+- **Type**: Retrospective
+- **General description**: Added TorchTitan manual downstream eval path and validated full `mmstar` scoring with explicit raw/fallback backend provenance.
+- **Details**:
+  - Implemented manual eval tooling in TorchTitan:
+    - `scripts/nanovlm_downstream_eval.py`
+    - `evaluation_torchtitan.sh`
+    - fallback plugin under `torchtitan/eval/`
+  - Executed full `mmstar` run:
+    - output dir: `eval_results/torchtitan/mmstar-full-20260310`
+    - score: `mmstar average,none = 0.3221761082`
+  - Backend behavior:
+    - raw `huggingface` failed fast due to missing processor assets in local checkpoint folder
+    - fallback `torchtitan_nanovlm` succeeded and produced final metrics
+  - Knowledge capture:
+    - added skill: `.codex/skills/torchtitan-downstream-eval-raw-first-fallback/SKILL.md`
+    - updated skill: `.codex/skills/torchtitan-upstream-alignment-guardrail/SKILL.md`
+    - added report: `training_reports/torchtitan-downstream-mmstar-eval-2026-03-10.md`
+
 ## 2026-03-05
 
 - **Date**: 2026-03-05

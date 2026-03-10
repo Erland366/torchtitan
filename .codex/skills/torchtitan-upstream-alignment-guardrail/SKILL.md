@@ -62,6 +62,9 @@ Keep shared runtime close to upstream and introduce explicit extension points fo
 - Keep model-specific metrics/statistics helpers out of `trainer.py` core
   by moving them to model-local helper modules or mixins under
   `torchtitan/models/<model_name>/`.
+- For downstream eval integration, keep lmms model wiring in model-local/plugin
+  modules (for example under `torchtitan/eval/`) instead of patching
+  `lmms_eval` package internals or shared TorchTitan runtime loops.
 
 ### Step 3: Enforce explicit acceptance checks
 
@@ -84,6 +87,7 @@ Keep shared runtime close to upstream and introduce explicit extension points fo
 | Runtime patched with model-specific key filtering | Shared code became brittle and diverged | Move key adaptation into model adapter hook |
 | Attempted architecture-shape forcing in TorchTitan config | Checkpoint tensor shape mismatches on load | Treat active loaded checkpoint shape as source of truth unless explicitly migrating weights |
 | Rank-asymmetric hook collectives | One rank entered DTensor gather while peers did not, causing NCCL watchdog timeout | Keep hook collectives rank-symmetric and prefer local-shard diagnostics |
+| Downstream eval tied to raw HF-only path | Local checkpoint lacked processor assets and raw backend failed | Keep raw-first fallback plugin strategy and record backend provenance in eval artifacts |
 
 ## Configuration
 
