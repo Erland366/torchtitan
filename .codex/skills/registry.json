@@ -2,7 +2,7 @@
   "domain": "research",
   "version": "1.0.0",
   "created": "2026-02-26",
-  "updated": "2026-03-10",
+  "updated": "2026-03-11",
   "skills": {
     "domain-advisor": {
       "type": "core",
@@ -55,6 +55,10 @@
     "torchtitan-downstream-eval-raw-first-fallback": {
       "type": "result",
       "description": "Run downstream eval with raw lmms backend first and deterministic TorchTitan plugin fallback when local checkpoints are not full HF bundles"
+    },
+    "torchtitan-nanovlm-export-contract": {
+      "type": "result",
+      "description": "Export TorchTitan nanoVLM checkpoints so they load directly in nanoVLM_main without manual patching"
     },
     "vlm-loss-parity-triangulation": {
       "type": "result",

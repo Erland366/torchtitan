@@ -46,15 +46,18 @@ Do NOT use when:
 
 ## Results Summary
 
-Reference run:
-- output: `eval_results/torchtitan/mmstar-full-20260310`
+Reference runs:
+- baseline output: `eval_results/torchtitan/mmstar-full-20260310`
+- cached-runtime output: `eval_results/torchtitan/mmstar-full-kvcache-regression-20260310`
 
 | Metric | Value | Notes |
 |--------|-------|-------|
 | task | `mmstar` | full set (`limit=null`) |
-| average | `0.3221761082` | from `per_task.json` |
+| average | `0.3221761082` | identical in both runs |
 | backend used | `torchtitan_nanovlm` | raw `huggingface` failed, fallback succeeded |
-| fallback duration | `2230.87s` | from `metadata.json` |
+| baseline fallback duration | `2230.87s` | from `mmstar-full-20260310/metadata.json` |
+| cached-runtime fallback duration | `1205.92s` | from `mmstar-full-kvcache-regression-20260310/metadata.json` |
+| cached-runtime speedup | `~45.9%` faster | same score, substantially lower fallback duration |
 
 ## Recommended Practice
 
@@ -80,11 +83,24 @@ Always retain:
 
 These are required for fair result interpretation.
 
+### Step 4: Check backend provenance before reporting scores
+
+For this checkpoint class, score interpretation is invalid without checking
+`metadata.backend_used`. A completed JSON artifact does not imply that the raw
+backend worked.
+
+### Step 5: Prefer the cached TorchTitan fallback runtime
+
+If fallback is required, use the standalone TorchTitan backend with KV-cache
+decode support. It preserves `mmstar` scores while avoiding the older
+full-sequence recompute path.
+
 ## Failure Modes
 
 | What Failed | Why | Lesson Learned |
 |-------------|-----|----------------|
 | Raw `huggingface` backend load | Local checkpoint missing processor config files expected by `AutoProcessor.from_pretrained` | Keep fallback plugin on by default for this checkpoint class |
+| Standalone fallback took impractically long | Decode path recomputed full sequence and vision path each generated token | Keep KV-cache runtime enabled for fallback eval and regression-check score parity after any runtime rewrite |
 | Mixed concurrent eval processes with same run name | Two runs write into same output dir and make completion status ambiguous | Keep one canonical run process and avoid duplicate launches per run name |
 | Silent backend ambiguity | Score file exists but backend origin unclear | Enforce `metadata.json` backend provenance checks before reporting numbers |
 
@@ -108,5 +124,7 @@ python scripts/nanovlm_downstream_eval.py \
 ## References
 
 - Report: `training_reports/torchtitan-downstream-mmstar-eval-2026-03-10.md`
+- Report: `training_reports/torchtitan-downstream-mmstar-kvcache-regression-2026-03-10.md`
 - Artifact dir: `eval_results/torchtitan/mmstar-full-20260310`
+- Artifact dir: `eval_results/torchtitan/mmstar-full-kvcache-regression-20260310`
 - Related skill: `.codex/skills/torchtitan-upstream-alignment-guardrail/SKILL.md`
