@@ -62,6 +62,9 @@ Keep shared runtime close to upstream and introduce explicit extension points fo
 - Keep model-specific metrics/statistics helpers out of `trainer.py` core
   by moving them to model-local helper modules or mixins under
   `torchtitan/models/<model_name>/`.
+- Keep shared or tied parameters inside the same FSDP unit. If a model ties
+  `output.weight` to `tok_embeddings.weight`, do not shard those modules under
+  different FSDP wrappers.
 - For downstream eval integration, keep lmms model wiring in model-local/plugin
   modules (for example under `torchtitan/eval/`) instead of patching
   `lmms_eval` package internals or shared TorchTitan runtime loops.
@@ -77,6 +80,11 @@ Keep shared runtime close to upstream and introduce explicit extension points fo
   - if a collective is needed, every participating rank must execute it in identical order
   - avoid implicit DTensor gathers (`full_tensor()`) in post-step hooks; prefer
     local shard reads plus explicit symmetric reductions
+- Separate correctness claims from parity claims:
+  - a distributed structural fix can be correct while still causing small
+    numerical drift in step-level parity benchmarks
+  - require explicit paired loss comparisons before claiming exact parity after
+    FSDP wrapping changes
 - Validate one short run after refactor and confirm no new compile-recompile
   regressions were introduced.
 
@@ -87,6 +95,7 @@ Keep shared runtime close to upstream and introduce explicit extension points fo
 | Runtime patched with model-specific key filtering | Shared code became brittle and diverged | Move key adaptation into model adapter hook |
 | Attempted architecture-shape forcing in TorchTitan config | Checkpoint tensor shape mismatches on load | Treat active loaded checkpoint shape as source of truth unless explicitly migrating weights |
 | Rank-asymmetric hook collectives | One rank entered DTensor gather while peers did not, causing NCCL watchdog timeout | Keep hook collectives rank-symmetric and prefer local-shard diagnostics |
+| Tied weights split across different FSDP units | Shared parameter semantics become structurally unsafe under sharding | Keep tied embedding and LM head inside one FSDP wrapper |
 | Downstream eval tied to raw HF-only path | Local checkpoint lacked processor assets and raw backend failed | Keep raw-first fallback plugin strategy and record backend provenance in eval artifacts |
 
 ## Configuration
@@ -100,6 +109,7 @@ port_policy:
     - no_new_model_specific_branches_in_checkpoint_manager
     - trainer_diff_is_orchestration_only
     - model_metrics_logic_lives_under_models_tree
+    - tied_parameters_share_fsdp_unit
     - no_rank_asymmetric_collectives_in_model_hooks
 ```
 

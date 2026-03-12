@@ -14,6 +14,35 @@ Each entry should include:
 
 <!-- New entries go above this line -->
 
+## 2026-03-12
+
+- **Date**: 2026-03-12
+- **Type**: Retrospective
+- **General description**: Benchmarked same-group FSDP wrapping for tied nanoVLM LM weights and confirmed it is structurally correct, slightly lowers VRAM, but does not preserve exact 100-step loss parity.
+- **Details**:
+  - Code change:
+    - `torchtitan/models/nanoVLM/parallelize.py` now shards `[tok_embeddings, norm, output]` together when `lm_tie_weights=True`.
+    - added unit test coverage in `tests/unit_tests/test_nanovlm_parallelize.py`.
+  - Validation:
+    - unit tests passed for tied vs untied grouping behavior.
+    - `2x A100` FSDP `100`-step W&B runs completed for both:
+      - `nanovlm_230m_vanilla_finevisionmax_nopack`
+      - `nanovlm_230m_momh_soft_gating_b5_tttv_nopack`
+  - Vanilla result:
+    - baseline `utriabh7`: final loss `5.8125`, median TPS `15207`, peak `59696 MiB`, elapsed `523s`
+    - tied-grouped `g3rn91jj`: final loss `5.8125`, median TPS `15557`, peak `58474 MiB`, elapsed `513s`
+    - deltas: `+350` TPS, `-1222 MiB`, `-10s`
+    - exact per-step parity: no (`3` mismatches, max abs diff `0.03125`)
+  - Soft-gating result:
+    - baseline `fws2j2m1`: final loss `5.4375`, median TPS `22440`, peak `59696 MiB`, elapsed `358s`
+    - tied-grouped `xqbxfkgh`: final loss `5.4375`, median TPS `22176`, peak `58780 MiB`, elapsed `357s`
+    - deltas: `-264` TPS, `-916 MiB`, `-1s`
+    - exact per-step parity: no (`1` mismatch, max abs diff `0.03125`)
+  - Decision:
+    - keep same-group FSDP wrapping as the correct implementation for tied weights.
+    - do not treat this as an exact-parity-preserving change.
+    - continue requiring explicit step-level loss comparison in parity-sensitive claims.
+
 ## 2026-03-11
 
 - **Date**: 2026-03-11
@@ -362,3 +391,18 @@ Each entry should include:
   - Outcome vs goals:
     - vanilla: all three goals satisfied (loss parity, faster runtime, lower VRAM);
     - soft-gating: speed and VRAM goals satisfied, loss parity still not satisfied.
+
+- **Date**: 2026-03-12
+- **Type**: Benchmark
+- **General description**: Compared best-of-family DDP vs FSDP at fixed effective batch on 2 GPUs.
+- **Details**:
+  - Added `scripts/nanovlm_ddp_vs_fsdp_benchmark.py` to search DDP/FSDP family winners across `ac_mode in {none, full}` and valid local-batch divisors for `global_batch_size=64`.
+  - Final 100-step winners with W&B logging:
+    - vanilla DDP `0ssc9oxh`: `lb16`, `ga2`, elapsed `601.99s`, peak VRAM `31841 MiB`.
+    - vanilla FSDP `1fxmbuta`: `lb8`, `ga4`, elapsed `610.50s`, peak VRAM `15627 MiB`.
+    - soft-gating DDP `9jhl8ou8`: `lb8`, `ga4`, elapsed `552.72s`, peak VRAM `21141 MiB`.
+    - soft-gating FSDP `2am53tou`: `lb16`, `ga2`, elapsed `532.83s`, peak VRAM `29487 MiB`.
+  - Outcome:
+    - vanilla: DDP faster, FSDP lower VRAM.
+    - soft-gating: FSDP faster, DDP lower VRAM.
+  - Conclusion: best family choice is config-dependent; FSDP is not categorically better than DDP at fixed effective batch in this environment.

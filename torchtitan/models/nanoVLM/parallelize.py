@@ -155,14 +155,11 @@ def _apply_fsdp(
             raise ValueError(
                 f"Invalid reshard_after_forward_policy: {reshard_after_forward_policy}."
             )
+    tail_group_reshard_after_forward = _tail_group_reshard_after_forward(
+        reshard_after_forward_policy
+    )
 
-    # Token embeddings
-    if model.tok_embeddings is not None:
-        fully_shard(
-            model.tok_embeddings,
-            **fsdp_config,
-            reshard_after_forward=reshard_after_forward,
-        )
+    tie_weights = bool(getattr(getattr(model, "config", None), "lm_tie_weights", False))
 
     # Vision encoder blocks
     for block in model.vision_encoder.blocks.values():
@@ -187,16 +184,47 @@ def _apply_fsdp(
             reshard_after_forward=reshard_after_forward,
         )
 
-    # Final norm + output (no reshard for last layers)
-    if model.norm is not None and model.output is not None:
+    # Keep tied token embeddings and output head in the same FSDP unit.
+    # Splitting a shared parameter across wrappers can break shared-weight
+    # assumptions under FSDP.
+    if (
+        tie_weights
+        and model.tok_embeddings is not None
+        and model.norm is not None
+        and model.output is not None
+    ):
         fully_shard(
-            [model.norm, model.output],
+            [model.tok_embeddings, model.norm, model.output],
             **fsdp_config,
-            reshard_after_forward=reshard_after_forward_policy == "always",
+            reshard_after_forward=tail_group_reshard_after_forward,
         )
+    else:
+        if model.tok_embeddings is not None:
+            fully_shard(
+                model.tok_embeddings,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward,
+            )
+
+        # Final norm + output (no reshard for last layers)
+        if model.norm is not None and model.output is not None:
+            fully_shard(
+                [model.norm, model.output],
+                **fsdp_config,
+                reshard_after_forward=tail_group_reshard_after_forward,
+            )
 
     # Top-level model
     fully_shard(model, **fsdp_config)
 
     # Disable FSDP's automatic gradient division
     disable_fsdp_gradient_division(model)
+
+
+def _tail_group_reshard_after_forward(reshard_after_forward_policy: str) -> bool:
+    """Return the reshard mode for the last FSDP-wrapped group.
+
+    The final decoder group behaves like the root module in TorchTitan's FSDP2
+    setup: keep params unsharded unless the user explicitly asks for always-reshard.
+    """
+    return reshard_after_forward_policy == "always"

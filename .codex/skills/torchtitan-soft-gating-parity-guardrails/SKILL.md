@@ -41,6 +41,7 @@ Do NOT use when:
 | Run Pair | Steps | Loss Mean Abs Diff | Loss Max Abs Diff | Baseline | Torchtitan |
 |----------|-------|--------------------|-------------------|----------|------------|
 | `soft-gating-datasettrace-softgating-finalcheck-20260301` | 10 | `0.00648` | `0.01582` (step 9) | `ce514a4q`, `147.16s`, `28499 MiB` | `md7kgkar`, `112.06s`, `22105 MiB` |
+| `fsdp-tied-weight-grouping-20260312` | 100 | `0.0003125` | `0.03125` (step 29) | `fws2j2m1`, `358s`, `59696 MiB` | `xqbxfkgh`, `357s`, `58780 MiB` |
 
 Derived deltas from this accepted check:
 - speed: ~`23.86%` faster (`1.313x`)
@@ -66,6 +67,10 @@ For extended checks (100 steps), report both:
 - early window (`steps 1-15`) max/mean deltas,
 - full window (`steps 1-100`) max/mean deltas.
 
+When applying structural distributed fixes, treat them as separate from parity acceptance.
+Even a correctness-improving FSDP change can preserve final loss while introducing small
+step-level drift. Do not upgrade such a run to "exact parity" unless the full step series matches.
+
 When comparing runtime configurations (for example AC `none` vs `full`), do not use those runs as parity evidence by default.
 Treat AC mode comparisons as performance/memory studies unless they are paired against baseline with full dataset-trace controls.
 
@@ -83,6 +88,7 @@ Never accept a parity fix that regresses the primary goals:
 | Optimizing only for speed/VRAM | Numeric drift remained hidden | Keep loss acceptance gate mandatory |
 | Changing many axes at once | Could not isolate cause of drift/regression | Run one hypothesis at a time with paired reruns |
 | Using AC-on/off loss deltas as parity verdict | AC-mode A/B is not a baseline-paired parity experiment | Use baseline-vs-Torchtitan paired runs with dataset-trace gate for parity claims |
+| Treating final-loss equality as exact parity | Distributed structural changes can preserve endpoint loss but perturb a few steps | Require full step-series comparison before claiming exact parity |
 
 ## Configuration
 
@@ -112,3 +118,5 @@ soft_gating_parity_gate:
 - `outputs/nanovlm_parity_benchmarks/soft-gating-soft20-nowarmconsume-20260301-1/summary.json`
 - `outputs/nanovlm_parity_benchmarks/soft-gating-soft20-nonepassthrough-20260301-1/summary.json`
 - `outputs/nanovlm_parity_benchmarks/soft-gating-soft20-validitysync-20260301-1/summary.json`
+- `outputs/fsdp_tie_group_bench_wandb/baseline_softgating_100/train.log`
+- `outputs/fsdp_tie_group_bench_wandb/patched_softgating_100/train.log`

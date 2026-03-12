@@ -69,6 +69,12 @@ The paper configs now use config-specific checkpoint folders and keep final save
 native DCP format (`last_save_in_hf=False`) so training resume behavior stays
 consistent.
 
+## FSDP Tied-Weight Note
+
+When `lm_tie_weights=True`, nanoVLM keeps `tok_embeddings`, `norm`, and `output`
+inside the same FSDP wrapper. Splitting the tied embedding and LM head across
+different FSDP units can break shared-weight assumptions under FSDP.
+
 ## HF Export Compatibility Notes
 
 When exporting nanoVLM checkpoints from TorchTitan to HF/nanoVLM safetensors:
