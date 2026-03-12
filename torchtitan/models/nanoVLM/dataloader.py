@@ -253,8 +253,37 @@ class VQADataset:
         item = self.dataset[idx]
         return self._process_data(item)
 
-    def iter_for_worker(self):
-        data_iterator = iter(self.dataset)
+    def _raw_data_source_for_worker(self, worker_id: int, num_workers: int):
+        data_source = self.dataset
+        if num_workers > 1 and hasattr(data_source, "shard"):
+            return data_source.shard(
+                num_shards=num_workers,
+                index=worker_id,
+                contiguous=False,
+            )
+        return data_source
+
+    def iter_for_worker(
+        self,
+        *,
+        worker_id: int = 0,
+        num_workers: int = 1,
+    ):
+        data_source = self._raw_data_source_for_worker(worker_id, num_workers)
+
+        if hasattr(data_source, "__len__"):
+            all_indices = range(len(data_source))
+            worker_indices = (
+                itertools.islice(all_indices, worker_id, None, num_workers)
+                if num_workers > 1
+                else all_indices
+            )
+
+            for idx in worker_indices:
+                yield self._process_data(data_source[idx])
+            return
+
+        data_iterator = iter(data_source)
         consecutive_fetch_failures = 0
         try:
             while True:
@@ -438,6 +467,7 @@ class ConstantLengthDataset(IterableDataset):
         self.max_images_per_knapsack = max_images_per_knapsack
         self.queue_size = max(queue_size, 1)
         self._sentinel = object()
+        self._error_sentinel = object()
         self._average_length_per_sample = self.dataset.mp_image_token_length + 198
 
     def __len__(self):
@@ -445,29 +475,27 @@ class ConstantLengthDataset(IterableDataset):
             len(self.dataset) * self._average_length_per_sample / self.seq_length
         )
 
-    def __iter__(self) -> Iterator[dict]:
+    @staticmethod
+    def _worker_context() -> tuple[int, int]:
         worker_info = get_worker_info()
-        worker_id = worker_info.id if worker_info else 0
-        num_workers = worker_info.num_workers if worker_info else 1
+        if worker_info is None:
+            return 0, 1
+        return worker_info.id, worker_info.num_workers
 
-        def make_base_iterator():
-            if not hasattr(self.dataset.dataset, "__len__"):
-                return self.dataset.iter_for_worker()
-            all_indices = range(len(self.dataset))
-            if num_workers > 1:
-                worker_indices = itertools.islice(all_indices, worker_id, None, num_workers)
-            else:
-                worker_indices = all_indices
+    def _make_base_iterator(self, worker_id: int, num_workers: int):
+        return self.dataset.iter_for_worker(
+            worker_id=worker_id,
+            num_workers=num_workers,
+        )
 
-            def sharded_item_iterator():
-                for idx in worker_indices:
-                    yield self.dataset[idx]
-
-            return sharded_item_iterator()
+    def __iter__(self) -> Iterator[dict]:
+        worker_id, num_workers = self._worker_context()
 
         queue: Queue = Queue(maxsize=self.queue_size)
         producer = threading.Thread(
-            target=self._producer, args=(make_base_iterator, queue), daemon=True
+            target=self._producer,
+            args=(lambda: self._make_base_iterator(worker_id, num_workers), queue),
+            daemon=True,
         )
         producer.start()
 
@@ -475,61 +503,67 @@ class ConstantLengthDataset(IterableDataset):
             batch_of_batches = queue.get()
             if batch_of_batches is self._sentinel:
                 break
+            if isinstance(batch_of_batches, tuple) and batch_of_batches[0] is self._error_sentinel:
+                raise RuntimeError("ConstantLengthDataset producer failed") from batch_of_batches[1]
             for batch in batch_of_batches:
                 yield batch
 
     def _producer(self, make_iterator, queue: Queue):
         iterator = make_iterator()
-        more_examples = True
+        try:
+            more_examples = True
 
-        while more_examples:
-            buffer, buffer_len = [], 0
-            while buffer_len < self.max_length:
-                try:
-                    sample = next(iterator)
-                except StopIteration:
-                    more_examples = False
+            while more_examples:
+                buffer, buffer_len = [], 0
+                while buffer_len < self.max_length:
+                    try:
+                        sample = next(iterator)
+                    except StopIteration:
+                        more_examples = False
+                        break
+
+                    if sample is None:
+                        continue
+                    if len(sample["input_ids"]) >= self.max_sample_length:
+                        continue
+                    if len(sample["images"]) > self.max_images_per_example:
+                        continue
+
+                    sample["input_ids"] = torch.cat(
+                        [sample["input_ids"], torch.tensor([self.dataset.tokenizer.pad_token_id])]
+                    )
+                    sample["attention_mask"] = torch.cat(
+                        [sample["attention_mask"], torch.tensor([0])]
+                    )
+                    sample["labels"] = torch.cat([sample["labels"], torch.tensor([-100])])
+
+                    buffer.append(sample)
+                    buffer_len += len(sample["input_ids"])
+
+                if not buffer:
                     break
 
-                if sample is None:
-                    continue
-                if len(sample["input_ids"]) >= self.max_sample_length:
-                    continue
-                if len(sample["images"]) > self.max_images_per_example:
-                    continue
-
-                sample["input_ids"] = torch.cat(
-                    [sample["input_ids"], torch.tensor([self.dataset.tokenizer.pad_token_id])]
-                )
-                sample["attention_mask"] = torch.cat(
-                    [sample["attention_mask"], torch.tensor([0])]
-                )
-                sample["labels"] = torch.cat([sample["labels"], torch.tensor([-100])])
-
-                buffer.append(sample)
-                buffer_len += len(sample["input_ids"])
-
-            if not buffer:
-                break
-
-            groups = self._balanced_greedy_knapsack(
-                buffer, self.seq_length, delta=5, max_images_per_knapsack=self.max_images_per_knapsack
-            )
-
-            packed_group = []
-            for g in groups:
-                packed = self._pack_one_group(g, buffer, self.seq_length)
-                packed_group.append(
-                    {
-                        "input_ids": packed[0],
-                        "labels": packed[1],
-                        "attention_mask": packed[2],
-                        "images": packed[3],
-                    }
+                groups = self._balanced_greedy_knapsack(
+                    buffer, self.seq_length, delta=5, max_images_per_knapsack=self.max_images_per_knapsack
                 )
 
-            if packed_group:
-                queue.put(packed_group)
+                packed_group = []
+                for g in groups:
+                    packed = self._pack_one_group(g, buffer, self.seq_length)
+                    packed_group.append(
+                        {
+                            "input_ids": packed[0],
+                            "labels": packed[1],
+                            "attention_mask": packed[2],
+                            "images": packed[3],
+                        }
+                    )
+
+                if packed_group:
+                    queue.put(packed_group)
+        except Exception as exc:
+            queue.put((self._error_sentinel, exc))
+            return
 
         queue.put(self._sentinel)
 
@@ -696,6 +730,7 @@ class NanoVLMIterableDataset(IterableDataset, Stateful):
             load_dataset,
             load_from_disk,
         )
+        from datasets.distributed import split_dataset_by_node
 
         self._streaming = streaming
         self._sample_idx = 0
@@ -758,12 +793,19 @@ class NanoVLMIterableDataset(IterableDataset, Stateful):
         if not streaming:
             hf_dataset = hf_dataset.shuffle(seed=0)
 
-        if dp_world_size > 1 and not streaming:
-            hf_dataset = hf_dataset.shard(
-                num_shards=dp_world_size,
-                index=dp_rank,
-                contiguous=False,
-            )
+        if dp_world_size > 1:
+            if streaming:
+                hf_dataset = split_dataset_by_node(
+                    hf_dataset,
+                    rank=dp_rank,
+                    world_size=dp_world_size,
+                )
+            else:
+                hf_dataset = hf_dataset.shard(
+                    num_shards=dp_world_size,
+                    index=dp_rank,
+                    contiguous=False,
+                )
 
         self._hf_data = hf_dataset if streaming else None
 
@@ -806,36 +848,13 @@ class NanoVLMIterableDataset(IterableDataset, Stateful):
                 # Yield raw sample dict; batch-level collation is handled by
                 # DataLoader collate_fn for parity with nanoVLM_main.
                 yield sample
-        elif self._streaming:
-            # For streaming datasets, partition by valid-sample index after
-            # VQA filtering. HF iterable sharding partitions data sources and
-            # can drift from 1-GPU sample composition step-by-step.
-            global_valid_sample_idx = 0
-            for sample in self.vqa_dataset.iter_for_worker():
-                if sample is None:
-                    continue
-                if (
-                    self._dp_world_size > 1
-                    and (global_valid_sample_idx % self._dp_world_size) != self._dp_rank
-                ):
-                    global_valid_sample_idx += 1
-                    continue
-                dp_local_sample_idx = global_valid_sample_idx // max(self._dp_world_size, 1)
-                global_valid_sample_idx += 1
-                if num_workers > 1 and (dp_local_sample_idx % num_workers) != worker_id:
-                    continue
-                self._sample_idx += 1
-                yield sample
         else:
-            worker_sample_idx = 0
-            for idx in range(len(self.vqa_dataset)):
-                sample = self.vqa_dataset[idx]
+            for sample in self.vqa_dataset.iter_for_worker(
+                worker_id=worker_id,
+                num_workers=num_workers,
+            ):
                 if sample is None:
                     continue
-                if num_workers > 1 and (worker_sample_idx % num_workers) != worker_id:
-                    worker_sample_idx += 1
-                    continue
-                worker_sample_idx += 1
                 self._sample_idx += 1
                 yield sample
 

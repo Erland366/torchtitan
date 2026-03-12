@@ -406,3 +406,29 @@ Each entry should include:
     - vanilla: DDP faster, FSDP lower VRAM.
     - soft-gating: FSDP faster, DDP lower VRAM.
   - Conclusion: best family choice is config-dependent; FSDP is not categorically better than DDP at fixed effective batch in this environment.
+
+- **Date**: 2026-03-12
+- **Type**: Diagnosis
+- **General description**: Isolated dataloader-bound throughput as the main cause of unexpectedly slow vanilla distributed training.
+- **Details**:
+  - Diagnostic runs used `nanovlm_230m_vanilla_finevisionmax_nopack`, `training.steps=30`, `local_batch_size=16`, `global_batch_size=64`, `activation-checkpoint.mode=none`, `num_workers=0`, compile enabled.
+  - 2-GPU DDP wall clock was nearly unchanged versus the 1-GPU control:
+    - 2-GPU, `log_freq=10`, TensorBoard on: `220.55s`
+    - 1-GPU, `log_freq=10`, TensorBoard on: `222.98s`
+  - Built-in TorchTitan timing metrics showed data loading dominating the step window:
+    - 2-GPU `time_metrics/data_loading(%)`: about `74.5%-77.2%`
+    - 1-GPU `time_metrics/data_loading(%)`: about `63.6%-64.5%`
+  - `log_freq=1` vs `log_freq=10` changed little in the 2-GPU control, so logging overhead is secondary.
+  - Conclusion: current vanilla throughput is primarily limited by the input/dataloader path rather than by DDP vs FSDP choice.
+
+- **Date**: 2026-03-12
+- **Type**: Implementation
+- **General description**: Moved nanoVLM dataloader rank/worker sharding ahead of preprocessing and made packed worker failures fail loudly.
+- **Details**:
+  - In `torchtitan/models/nanoVLM/dataloader.py`, streaming datasets are now split by DP rank before VQA processing using `datasets.distributed.split_dataset_by_node(...)`.
+  - `VQADataset.iter_for_worker(...)` now shards raw worker input before image decode and tokenizer work for both map-style and streaming sources.
+  - `ConstantLengthDataset` now sources packed samples from the worker-aware iterator and propagates producer-thread exceptions back to the consumer instead of hanging on an empty queue.
+  - Foreground validation on `nanovlm_230m_vanilla_finevisionmax_nopack` (`2` GPUs, DDP, `steps=20`, `log_freq=10`, no TB/W&B):
+    - `num_workers=0`: elapsed `133.38s`, median TPS `18306.5`
+    - `num_workers=2`: elapsed `109.38s`, median TPS `46916.0`
+  - Outcome: the `num_workers=2` path completed cleanly and was about `18%` faster over this control run.

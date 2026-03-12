@@ -56,6 +56,10 @@
       "type": "result",
       "description": "Keep tied LM embedding and head weights inside one FSDP unit and verify parity separately from correctness"
     },
+    "torchtitan-dataloader-bound-throughput-diagnosis": {
+      "type": "result",
+      "description": "Detect when slow TorchTitan training is dominated by the input pipeline rather than DDP/FSDP choice"
+    },
     "torchtitan-downstream-eval-raw-first-fallback": {
       "type": "result",
       "description": "Run downstream eval with raw lmms backend first and deterministic TorchTitan plugin fallback when local checkpoints are not full HF bundles"

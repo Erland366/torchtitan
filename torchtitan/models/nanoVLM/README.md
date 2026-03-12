@@ -48,6 +48,13 @@ The paper config is set to mirror `nanoVLM_main/configs/train.paper.vanilla-fine
   - batch-level `VQACollator` execution (not per-sample pre-collation)
   - preserves the same long-sample filtering behavior as `nanoVLM_main`
     and keeps token/image stream order in sync
+- Dataloader sharding moved ahead of expensive preprocessing:
+  - streaming datasets are split by DP rank before image/tokenizer work
+  - worker sharding happens before VQA processing for both streaming and
+    map-style paths
+  - packed-mode workers now use the same worker-aware source iterator
+  - avoids duplicated decode/resize/tokenization across ranks and workers and
+    fixes the main throughput bottleneck observed in multi-GPU vanilla runs
 - Startup dataloader warmup aligned:
   - Torchtitan discards one initial nanoVLM microbatch before optimization to
     mirror `nanoVLM_main` worker warmup behavior
@@ -57,6 +64,9 @@ The paper config is set to mirror `nanoVLM_main/configs/train.paper.vanilla-fine
     `nanoVLM_main/ConstantLengthDataset(num_of_sequences=batch_size * 4)`
   - avoids oversized prefetch buffers that previously caused large startup
     latency in packing/pretraining runs
+- Packing producer errors are surfaced:
+  - uncaught packing-thread failures now raise immediately in the worker
+    iterator instead of leaving the DataLoader blocked on an empty queue
 
 ## Throughput Logging Caveat
 

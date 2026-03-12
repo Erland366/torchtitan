@@ -45,6 +45,8 @@ Do NOT use when:
 ## Recommended Practice
 
 Keep shared runtime close to upstream and introduce explicit extension points for model-only behavior.
+When end-to-end training is slow, prove whether the bottleneck is runtime logic
+or the input path before widening distributed/runtime changes.
 
 ### Step 1: Revert shared runtime first
 
@@ -80,6 +82,9 @@ Keep shared runtime close to upstream and introduce explicit extension points fo
   - if a collective is needed, every participating rank must execute it in identical order
   - avoid implicit DTensor gathers (`full_tensor()`) in post-step hooks; prefer
     local shard reads plus explicit symmetric reductions
+- Separate distributed-family benchmarking from dataloader diagnosis:
+  - if built-in timing metrics show data loading dominating step time, treat
+    dataloader optimization as the primary speed lever before revisiting DDP/FSDP
 - Separate correctness claims from parity claims:
   - a distributed structural fix can be correct while still causing small
     numerical drift in step-level parity benchmarks
@@ -96,6 +101,7 @@ Keep shared runtime close to upstream and introduce explicit extension points fo
 | Attempted architecture-shape forcing in TorchTitan config | Checkpoint tensor shape mismatches on load | Treat active loaded checkpoint shape as source of truth unless explicitly migrating weights |
 | Rank-asymmetric hook collectives | One rank entered DTensor gather while peers did not, causing NCCL watchdog timeout | Keep hook collectives rank-symmetric and prefer local-shard diagnostics |
 | Tied weights split across different FSDP units | Shared parameter semantics become structurally unsafe under sharding | Keep tied embedding and LM head inside one FSDP wrapper |
+| Slow training blamed on distributed family choice too early | End-to-end wall clock was dominated by the dataloader/input path | Check `time_metrics/data_loading(%)` and 1-GPU vs 2-GPU scaling before changing shared runtime |
 | Downstream eval tied to raw HF-only path | Local checkpoint lacked processor assets and raw backend failed | Keep raw-first fallback plugin strategy and record backend provenance in eval artifacts |
 
 ## Configuration

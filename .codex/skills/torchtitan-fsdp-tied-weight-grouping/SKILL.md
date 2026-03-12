@@ -25,7 +25,8 @@ When `output.weight` is tied to `tok_embeddings.weight`, both sides of that
 shared parameter should remain inside the same FSDP unit.
 
 This is primarily a correctness and maintainability rule. It can reduce VRAM
-slightly, but it should not be treated as automatic evidence of exact parity.
+slightly, but it should not be treated as automatic evidence of exact parity or
+as a primary speed fix for dataloader-bound runs.
 
 ## When to Apply
 
@@ -79,6 +80,7 @@ Treat this as:
 
 Do not treat it as:
 - proof of exact numerical parity
+- proof that end-to-end training will speed up if the workload is input-bound
 
 Final-loss equality is not enough after FSDP wrapping changes.
 
