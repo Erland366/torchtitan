@@ -812,9 +812,7 @@ class Trainer(
             else 1
         )
         per_microbatch_stats: list[dict[str, Any]] = []
-        for microbatch_idx, (input_dict, labels, data_load_time) in enumerate(
-            microbatches, start=1
-        ):
+        for input_dict, labels, data_load_time in microbatches:
             batch_start_time = time.perf_counter()
             nanovlm_stats: _NanoVLMMicrobatchStats | None = None
             if self._is_nanovlm:
