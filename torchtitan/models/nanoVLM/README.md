@@ -26,10 +26,12 @@ The paper config is set to mirror `nanoVLM_main/configs/train.paper.vanilla-fine
 - Compile scope aligned with original behavior:
   - compile model blocks
   - compile loss (fuses logits->CE path and reduces peak reserved VRAM)
-  - use Torchtitan native per-block compile path (`apply_compile`)
-    rather than a custom nanoVLM forward-wrapper compile
-  - warm flex-attention compile paths (prefill/decode, structural/soft-gating)
-    before model block compile to stabilize first training steps
+- use Torchtitan native per-block compile path (`apply_compile`)
+  rather than a custom nanoVLM forward-wrapper compile
+- warm flex-attention compile paths (prefill/decode, structural/soft-gating)
+  before model block compile to stabilize first training steps
+- keep packed vanilla pretraining configs on the same `["model", "loss"]`
+  compile recipe as the faster no-pack paths
 - Vision encoder init parity:
   - ViT patch position embedding init uses `uniform_(0, 1)` to match
     `nanoVLM_main` constructor semantics
@@ -48,6 +50,8 @@ The paper config is set to mirror `nanoVLM_main/configs/train.paper.vanilla-fine
   - batch-level `VQACollator` execution (not per-sample pre-collation)
   - preserves the same long-sample filtering behavior as `nanoVLM_main`
     and keeps token/image stream order in sync
+  - the collator now returns the final flat image tensor directly, removing an
+    extra post-collate Python flatten pass in the training hot path
 - Dataloader sharding moved ahead of expensive preprocessing:
   - streaming datasets are split by DP rank before image/tokenizer work
   - worker sharding happens before VQA processing for both streaming and
@@ -55,15 +59,27 @@ The paper config is set to mirror `nanoVLM_main/configs/train.paper.vanilla-fine
   - packed-mode workers now use the same worker-aware source iterator
   - avoids duplicated decode/resize/tokenization across ranks and workers and
     fixes the main throughput bottleneck observed in multi-GPU vanilla runs
+- FineVisionMax nopack queue tuning updated:
+  - the default vanilla FineVisionMax nopack config now uses
+    `prefetch_factor=4` with `num_workers=2`
+  - on the repaired worker path this improved a 15-step 2-GPU vanilla DDP
+    control from `96.85s` to `85.51s` without changing loss or peak VRAM
 - Startup dataloader warmup aligned:
   - Torchtitan discards one initial nanoVLM microbatch before optimization to
     mirror `nanoVLM_main` worker warmup behavior
   - avoids one-microbatch stream skew that previously caused loss drift
 - Packing queue sizing aligned:
-  - `packing_num_sequences` defaults to `local_batch_size * 4` to mirror
-    `nanoVLM_main/ConstantLengthDataset(num_of_sequences=batch_size * 4)`
-  - avoids oversized prefetch buffers that previously caused large startup
-    latency in packing/pretraining runs
+  - packed Cauldron paper configs now pin `packing_num_sequences=8`
+    instead of following `local_batch_size * 4`
+  - this keeps the packed prefetch buffer small enough to recover steady-state
+    throughput on the single-GPU packed vanilla path
+  - on the config-backed `100`-step packed benchmark, this reduced TorchTitan
+    wall clock from `2602s` to `2375s`
+- Packed producer queue depth aligned:
+  - `packing_queue_size` now defaults to `4` to match
+    `nanoVLM_main/ConstantLengthDataset(queue_size=4)`
+  - a short packed diagnostic showed this parity fix is low-impact by itself;
+    the stronger throughput lever was lowering `packing_num_sequences`
 - Packing producer errors are surfaced:
   - uncaught packing-thread failures now raise immediately in the worker
     iterator instead of leaving the DataLoader blocked on an empty queue

@@ -23,6 +23,40 @@ from ..optimizer import NanoVLMOptimizersContainer
 
 _NANOVLM_230M_REPO = "lusxvr/nanoVLM-230M-8k"
 _MOMH_SOFT_GATING_B5_TTTV_CKPT_ENV = "NANOVLM_SOFT_GATING_INIT_CKPT"
+_PACKED_CAULDRON_NUM_SEQUENCES = 8
+_PACKED_CAULDRON_QUEUE_SIZE = 4
+
+
+def _compile_model_and_loss() -> CompileConfig:
+    """Use the standard nanoVLM compile recipe for performance runs."""
+    return CompileConfig(enable=True, components=["model", "loss"])
+
+
+def _packed_cauldron_dataloader(max_sample_length: int) -> NanoVLMDataLoader.Config:
+    """Use the tuned packed-dataloader recipe for Cauldron pretraining."""
+    return NanoVLMDataLoader.Config(
+        dataset_path="patrickamadeus/the_cauldron",
+        dataset_name=["all"],
+        use_packing=True,
+        streaming=True,
+        max_images_per_example=1,
+        max_images_per_knapsack=18,
+        max_sample_length=max_sample_length,
+        vit_img_size=512,
+        mp_pixel_shuffle_factor=4,
+        mp_image_token_length=64,
+        tokenizer_name="HuggingFaceTB/SmolLM2-135M-Instruct",
+        max_img_size=2048,
+        num_workers=2,
+        persistent_workers=True,
+        pin_memory=True,
+        packing_num_sequences=_PACKED_CAULDRON_NUM_SEQUENCES,
+        packing_queue_size=_PACKED_CAULDRON_QUEUE_SIZE,
+        relevance_min_rating=1,
+        image_correspondence_min_rating=1,
+        visual_dependency_min_rating=1,
+        formatting_min_rating=1,
+    )
 
 
 def _with_model_overrides(
@@ -132,7 +166,7 @@ def nanovlm_230m_structural_gating_finevisionmax_nopack() -> Trainer.Config:
         activation_checkpoint=ActivationCheckpointConfig(
             mode="none",
         ),
-        compile=CompileConfig(enable=True, components=["model", "loss"]),
+        compile=_compile_model_and_loss(),
         debug=DebugConfig(seed=0),
     )
 
@@ -189,6 +223,7 @@ def nanovlm_230m_vanilla_finevisionmax_nopack() -> Trainer.Config:
             tokenizer_name="HuggingFaceTB/SmolLM2-135M-Instruct",
             max_img_size=2048,
             num_workers=2,
+            prefetch_factor=4,
             pin_memory=True,
             relevance_min_rating=1,
             image_correspondence_min_rating=1,
@@ -209,7 +244,7 @@ def nanovlm_230m_vanilla_finevisionmax_nopack() -> Trainer.Config:
         activation_checkpoint=ActivationCheckpointConfig(
             mode="none",
         ),
-        compile=CompileConfig(enable=True, components=["model", "loss"]),
+        compile=_compile_model_and_loss(),
         debug=DebugConfig(seed=0),
     )
 
@@ -221,7 +256,7 @@ def nanovlm_230m_vanilla_pretrain_cauldron_pack() -> Trainer.Config:
       - dataset: patrickamadeus/the_cauldron (config 'all')
       - packing enabled, seq_len/max_sample_length=8192
       - local batch size 4, global batch size 64 (grad accum 16 on 1 GPU)
-      - compile disabled
+      - compile enabled for model and loss
       - model-only init from lusxvr/nanoVLM-230M-8k
     """
     hf_local_path = _resolve_hf_repo(_NANOVLM_230M_REPO)
@@ -254,27 +289,7 @@ def nanovlm_230m_vanilla_pretrain_cauldron_pack() -> Trainer.Config:
             steps=20000,
             max_norm=1.0,
         ),
-        dataloader=NanoVLMDataLoader.Config(
-            dataset_path="patrickamadeus/the_cauldron",
-            dataset_name=["all"],
-            use_packing=True,
-            streaming=True,
-            max_images_per_example=1,
-            max_images_per_knapsack=18,
-            max_sample_length=8192,
-            vit_img_size=512,
-            mp_pixel_shuffle_factor=4,
-            mp_image_token_length=64,
-            tokenizer_name="HuggingFaceTB/SmolLM2-135M-Instruct",
-            max_img_size=2048,
-            num_workers=2,
-            persistent_workers=True,
-            pin_memory=True,
-            relevance_min_rating=1,
-            image_correspondence_min_rating=1,
-            visual_dependency_min_rating=1,
-            formatting_min_rating=1,
-        ),
+        dataloader=_packed_cauldron_dataloader(max_sample_length=8192),
         metrics=MetricsProcessor.Config(log_freq=50, enable_wandb=True),
         checkpoint=CheckpointManager.Config(
             enable=True,
@@ -289,7 +304,7 @@ def nanovlm_230m_vanilla_pretrain_cauldron_pack() -> Trainer.Config:
         activation_checkpoint=ActivationCheckpointConfig(
             mode="none",
         ),
-        compile=CompileConfig(enable=False, components=["model"]),
+        compile=_compile_model_and_loss(),
         debug=DebugConfig(seed=0),
     )
 
@@ -299,6 +314,7 @@ def nanovlm_230m_vanilla_pretrain_cauldron_pack_2k() -> Trainer.Config:
 
     Purpose: fast parity validation for the pretraining code path (packing
     enabled) without the heavy 8k memory/latency footprint.
+    Uses the same compile policy as the main packed 8k run.
     """
     hf_local_path = _resolve_hf_repo(_NANOVLM_230M_REPO)
 
@@ -330,27 +346,7 @@ def nanovlm_230m_vanilla_pretrain_cauldron_pack_2k() -> Trainer.Config:
             steps=20000,
             max_norm=1.0,
         ),
-        dataloader=NanoVLMDataLoader.Config(
-            dataset_path="patrickamadeus/the_cauldron",
-            dataset_name=["all"],
-            use_packing=True,
-            streaming=True,
-            max_images_per_example=1,
-            max_images_per_knapsack=18,
-            max_sample_length=2048,
-            vit_img_size=512,
-            mp_pixel_shuffle_factor=4,
-            mp_image_token_length=64,
-            tokenizer_name="HuggingFaceTB/SmolLM2-135M-Instruct",
-            max_img_size=2048,
-            num_workers=2,
-            persistent_workers=True,
-            pin_memory=True,
-            relevance_min_rating=1,
-            image_correspondence_min_rating=1,
-            visual_dependency_min_rating=1,
-            formatting_min_rating=1,
-        ),
+        dataloader=_packed_cauldron_dataloader(max_sample_length=2048),
         metrics=MetricsProcessor.Config(log_freq=50, enable_wandb=True),
         checkpoint=CheckpointManager.Config(
             enable=True,
@@ -365,7 +361,7 @@ def nanovlm_230m_vanilla_pretrain_cauldron_pack_2k() -> Trainer.Config:
         activation_checkpoint=ActivationCheckpointConfig(
             mode="none",
         ),
-        compile=CompileConfig(enable=False, components=["model"]),
+        compile=_compile_model_and_loss(),
         debug=DebugConfig(seed=0),
     )
 
@@ -442,7 +438,7 @@ def nanovlm_230m_momh_soft_gating_b5_tttv_nopack() -> Trainer.Config:
         activation_checkpoint=ActivationCheckpointConfig(
             mode="none",
         ),
-        compile=CompileConfig(enable=True, components=["model", "loss"]),
+        compile=_compile_model_and_loss(),
         debug=DebugConfig(seed=0),
     )
     return cfg

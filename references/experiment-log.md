@@ -14,7 +14,124 @@ Each entry should include:
 
 <!-- New entries go above this line -->
 
-## 2026-03-12
+## 2026-03-13
+
+- **Date**: 2026-03-13
+- **Type**: Packed-path tuning
+- **General description**: Promoted the packed-buffer tuning into the packed Cauldron paper configs and confirmed the config-backed `100`-step packed TorchTitan run is materially faster than the old baseline, but still slower than `nanoVLM_main`.
+- **Details**:
+  - Code change:
+    - `torchtitan/models/nanoVLM/configs/paper.py` now routes packed Cauldron configs through a shared packed dataloader helper with:
+      - `packing_num_sequences=8`
+      - `packing_queue_size=4`
+  - Rationale:
+    - the packed diagnosis showed `packing_num_sequences` was the real throughput lever, while queue-depth parity had little effect by itself
+  - Config-backed TorchTitan packed rerun:
+    - output: `outputs/packed_config_default_final_20260313`
+    - hardware: `1x A100 40GB`
+    - `local_batch_size=8`, `global_batch_size=64`, `compile=true`, `activation-checkpoint.mode=full`
+    - elapsed: `2375s`
+    - steady-state memory: `37.66 GiB`
+  - Comparison:
+    - old TorchTitan packed baseline: `2602s`
+    - tuned TorchTitan packed run: `2375s`
+    - improvement: about `8.7%`
+    - packed `nanoVLM_main` baseline remains faster at `2097s`
+    - tuned TorchTitan is still about `13.3%` slower than packed `nanoVLM_main`
+
+- **Date**: 2026-03-13
+- **Type**: Packed-path diagnosis
+- **General description**: Isolated the packed TorchTitan slowdown after the single-GPU packed vanilla benchmark. The slowdown is in the steady-state packed loop, not in compile startup, and `packing_num_sequences` is a stronger lever than queue depth.
+- **Details**:
+  - Compared packed logs from:
+    - `outputs/packing_benchmark_compile_ac_20260313/nanovlm_main_bs2_final`
+    - `outputs/packing_benchmark_compile_ac_20260313/torchtitan_bs8_final`
+  - Startup tax is roughly the same on both stacks:
+    - `nanoVLM_main`: `2097s` shell wall clock vs `1999.35s` in-loop epoch time (`~98s` outside the train loop)
+    - TorchTitan: shell wall clock `2602s`; timestamped logs show a similar `~100s` startup/shutdown envelope
+  - The packed gap is therefore not a compile-startup problem; it is a steady-state train-loop problem.
+  - Short packed TorchTitan diagnostics (`10` steps, `1x A100 40GB`, `compile=true`, `activation-checkpoint.mode=full`):
+    - baseline packed path (`lb8`, default `packing_num_sequences=32`, default queue size `2`):
+      - step `10` reached at about `318s` from process start
+      - memory around `35.34 GiB`
+    - `lb8` with `--dataloader.packing_num_sequences 8`:
+      - step `10` reached at about `291s` from process start
+      - memory increased to `37.66 GiB`
+      - throughput improved enough to finish the `10`-step run inside the `300s` foreground window
+    - `lb8` with `packing_num_sequences=8` and new `packing_queue_size=4` default:
+      - step `10` reached at about `289s` from process start
+      - essentially the same as queue size `2`
+    - `lb4` on the current packed path:
+      - did not reach step `10` within the `300s` foreground window
+  - Outcome:
+    - lowering `packing_num_sequences` from `32` to `8` is the meaningful packed-speed lever seen so far
+    - matching `queue_size=4` to `nanoVLM_main` is correct parity, but it is not the main source of the packed slowdown
+    - packed TorchTitan still runs near the VRAM cliff and shows allocation-retry behavior in the 100-step run
+
+- **Date**: 2026-03-13
+- **Type**: Benchmark
+- **General description**: Compared `nanoVLM_main` vs TorchTitan on the non-packing vanilla FineVisionMax path using the current performance policy: `compile=true`, activation checkpointing enabled, effective batch size `64`, and best safe local batch per stack.
+- **Details**:
+  - Hardware: `1x A100 40GB`
+  - Dataset: `HuggingFaceM4/FineVisionMax` (`use_packing=false`)
+  - Search policy: foreground validation with a `300s` cap, then one timed `100`-step run at the highest safe batch for each stack.
+  - `nanoVLM_main`:
+    - config base: `configs/train.paper.vanilla-finevisionmax.nopack.yaml`
+    - overrides: `compile=true`, `activation_checkpointing=true`, `activation_checkpointing_mode=regular`, `max_training_steps=100`, `log_wandb=false`
+    - `bs32, ga2` failed on first forward with `CUDA out of memory`
+    - `bs16, ga4` failed on first backward with `6.01 GiB` allocation
+    - `bs8, ga8` was the highest safe setting
+    - final timed output: `outputs/nopack_benchmark_compile_ac_20260313/nanovlm_bs8_final`
+    - elapsed wall clock: `364.498s`
+    - final log summary: `Time: 263.21s`, `T/s: 12559.32`
+  - TorchTitan:
+    - config base: `nanovlm_230m_vanilla_finevisionmax_nopack`
+    - overrides: `--activation-checkpoint.mode full`, `--training.global-batch-size 64`, `--metrics.no-enable-wandb`, `--metrics.no-enable-tensorboard`, `--checkpoint.no-enable`
+    - `lb32, ga2` completed `100` validation steps within the `300s` foreground window and was the highest safe setting
+    - final timed output: `outputs/nopack_benchmark_compile_ac_20260313/torchtitan_lb32_final`
+    - elapsed wall clock: `314.013s`
+    - steady-state logged memory: `25.81 GiB`
+  - Outcome:
+    - TorchTitan speed relative to `nanoVLM_main`: `364.498 / 314.013 = 1.161x`
+    - equivalently, TorchTitan was about `16.1%` faster in wall clock on this non-packing single-GPU vanilla benchmark.
+
+- **Date**: 2026-03-13
+- **Type**: Retrospective
+- **General description**: Re-ran packed vanilla benchmarking under the corrected policy (`compile=true`, activation checkpointing enabled) and found TorchTitan still slower than `nanoVLM_main` on the single-GPU packed path, even after fixing packed TorchTitan to compile the loss.
+- **Details**:
+  - Benchmark policy correction:
+    - the earlier packed benchmark was invalid for performance conclusions because it inherited `compile=false` from the source configs.
+    - new rule for performance benchmarking in this project: keep `compile=true` unless the experiment is explicitly about compile-off behavior.
+    - also avoid concurrent validators on the same GPU; one earlier OOM was invalidated by GPU contention.
+  - Code correction for packed TorchTitan configs:
+    - `nanovlm_230m_vanilla_pretrain_cauldron_pack` and `_pack_2k` now default to `compile=CompileConfig(enable=True, components=["model", "loss"])`.
+    - this materially lowered packed-step memory and raised the best safe TorchTitan batch size.
+  - Corrected packed vanilla search on `1x A100 40GB`, `effective batch = 64`, `use_packing=true`, dataset `patrickamadeus/the_cauldron`:
+    - `nanoVLM_main`, `compile=true`, activation checkpointing enabled (`regular`):
+      - `bs4, ga16` failed on first backward (`6.01 GiB` allocation)
+      - `bs2, ga32` passed validation and became the stable setting
+    - `TorchTitan`, `compile=true`, `activation-checkpoint.mode=full`, loss compile enabled:
+      - `bs16, ga4` failed on first backward (`12.02 GiB` allocation)
+      - `bs8, ga8` passed validation and became the stable setting
+      - `bs4, ga16` also passed, but was no longer the best safe setting after the loss-compile fix
+  - Final 100-step timed runs:
+    - `nanoVLM_main` packed final:
+      - output: `outputs/packing_benchmark_compile_ac_20260313/nanovlm_main_bs2_final`
+      - elapsed: `2097s`
+      - final training summary: `Time: 1999.35s`, `T/s: 15258.53`
+    - `TorchTitan` packed final:
+      - output: `outputs/packing_benchmark_compile_ac_20260313/torchtitan_bs8_final`
+      - elapsed: `2602s`
+      - final step 100 TPS: `20537`
+      - final logged memory: `35.34 GiB`
+  - Outcome:
+    - TorchTitan speedup vs `nanoVLM_main` on this corrected packed benchmark = `2097 / 2602 = 0.806x`
+    - equivalently, TorchTitan was `24.1%` slower in wall clock.
+  - Interpretation:
+    - enabling compile and activation checkpointing improved the `nanoVLM_main` packed baseline substantially (`2472s -> 2097s`).
+    - fixing packed TorchTitan to compile the loss improved its best safe packed batch size (`bs4 -> bs8`) and reduced step-1 memory (`29.45 GiB -> 20.42 GiB` at the validation point), but it still did not recover a wall-clock advantage on this single-GPU packed vanilla path.
+    - performance conclusions for TorchTitan should continue to focus on the distributed paths where it has structural advantages, rather than assuming packed single-GPU vanilla is a win.
+
 
 - **Date**: 2026-03-12
 - **Type**: Retrospective
@@ -432,3 +549,18 @@ Each entry should include:
     - `num_workers=0`: elapsed `133.38s`, median TPS `18306.5`
     - `num_workers=2`: elapsed `109.38s`, median TPS `46916.0`
   - Outcome: the `num_workers=2` path completed cleanly and was about `18%` faster over this control run.
+
+- **Date**: 2026-03-12
+- **Type**: Tuning + Benchmark
+- **General description**: Verified that loader queue depth and the repaired worker path make the soft-gating scaling result sensible.
+- **Details**:
+  - Narrow queue-depth sweep on `nanovlm_230m_vanilla_finevisionmax_nopack` (`2` GPUs, DDP, `steps=15`, no TB/W&B):
+    - `num_workers=2, prefetch_factor=2`: elapsed `96.85s`
+    - `num_workers=2, persistent_workers=True, prefetch_factor=2`: elapsed `112.40s`
+    - `num_workers=2, persistent_workers=True, prefetch_factor=4`: elapsed `85.51s`
+  - Result: `prefetch_factor=4` helped materially on the repaired worker path; `persistent_workers` alone did not.
+  - Follow-up soft-gating scaling check (`100` steps, no TB/W&B, `prefetch_factor=4`, `num_workers=2`):
+    - `1` GPU: `384s`
+    - `2` GPU DDP: `330s`
+    - `2` GPU FSDP: `240s`
+  - Conclusion: after the dataloader fixes, soft-gating scaling now follows the expected order in this environment: `FSDP` fastest, then `DDP`, then `1` GPU.

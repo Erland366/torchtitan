@@ -54,6 +54,9 @@ Additional controls:
 Interpretation:
 - logging overhead exists, but it is not the primary bottleneck
 - the main bottleneck is input/data loading
+- packed-path regressions can survive after worker sharding is fixed; in that
+  case, inspect packing-buffer depth (`packing_num_sequences`) separately from
+  general worker/prefetch tuning
 
 ## Recommended Practice
 

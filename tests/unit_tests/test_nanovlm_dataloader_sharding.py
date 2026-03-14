@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import sys
 
 import pytest
 import torch
 
-from torchtitan.models.nanoVLM.dataloader import ConstantLengthDataset, VQADataset
+from torchtitan.models.nanoVLM.dataloader import ConstantLengthDataset, VQACollator, VQADataset
 
 
 def _make_vqa_dataset(raw_dataset):
@@ -116,3 +117,139 @@ def test_constant_length_dataset_raises_when_producer_fails():
 
     with pytest.raises(RuntimeError, match="producer failed"):
         list(dataset)
+
+
+def test_iterable_dataset_passes_packing_queue_size_to_constant_length(monkeypatch):
+    captured = {}
+
+    class FakePackedDataset:
+        def __iter__(self):
+            return iter(())
+
+    class FakeHFDataset(list):
+        def shuffle(self, seed):
+            del seed
+            return self
+
+    class FakeVQADataset:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            self.mp_image_token_length = 16
+            self.tokenizer = SimpleNamespace(pad_token_id=0)
+
+    class FakeDatasetsModule:
+        @staticmethod
+        def load_dataset(*args, **kwargs):
+            del args, kwargs
+            return FakeHFDataset([0])
+
+        @staticmethod
+        def load_from_disk(*args, **kwargs):
+            del args, kwargs
+            return FakeHFDataset([0])
+
+        @staticmethod
+        def concatenate_datasets(datasets):
+            return datasets[0]
+
+        @staticmethod
+        def interleave_datasets(datasets, stopping_strategy):
+            del stopping_strategy
+            return datasets[0]
+
+        @staticmethod
+        def get_dataset_config_names(dataset_path):
+            del dataset_path
+            return ["default"]
+
+    class FakeDistributedModule:
+        @staticmethod
+        def split_dataset_by_node(dataset, rank, world_size):
+            del rank, world_size
+            return dataset
+
+    def fake_constant_length_dataset(*args, **kwargs):
+        del args
+        captured["queue_size"] = kwargs["queue_size"]
+        captured["num_of_sequences"] = kwargs["num_of_sequences"]
+        return FakePackedDataset()
+
+    monkeypatch.setattr(
+        "torchtitan.models.nanoVLM.dataloader.VQADataset",
+        FakeVQADataset,
+    )
+    monkeypatch.setattr(
+        "torchtitan.models.nanoVLM.dataloader.ConstantLengthDataset",
+        fake_constant_length_dataset,
+    )
+    monkeypatch.setitem(sys.modules, "datasets", FakeDatasetsModule)
+    monkeypatch.setitem(sys.modules, "datasets.distributed", FakeDistributedModule)
+
+    dataset = __import__(
+        "torchtitan.models.nanoVLM.dataloader",
+        fromlist=["NanoVLMIterableDataset"],
+    ).NanoVLMIterableDataset(
+        dataset_path="dummy",
+        dataset_name=["default"],
+        tokenizer=SimpleNamespace(pad_token_id=0),
+        image_processor=None,
+        mp_image_token_length=16,
+        seq_len=32,
+        use_packing=True,
+        streaming=False,
+        packing_num_sequences=8,
+        packing_queue_size=4,
+        max_sample_length=64,
+        max_images_per_example=1,
+        max_images_per_knapsack=2,
+        relevance_min_rating=1,
+        image_correspondence_min_rating=1,
+        visual_dependency_min_rating=1,
+        formatting_min_rating=1,
+        image_token_id=0,
+        dp_rank=0,
+        dp_world_size=1,
+    )
+
+    assert dataset.packed_dataset is not None
+    assert captured == {"queue_size": 4, "num_of_sequences": 8}
+
+
+def test_vqa_collator_returns_flat_image_tensor():
+    collator = VQACollator(SimpleNamespace(pad_token_id=0), max_length=4)
+    image_a = torch.randn(2, 3, 4, 4)
+    image_b = torch.randn(1, 3, 4, 4)
+
+    batch = [
+        {
+            "input_ids": torch.tensor([1, 2], dtype=torch.long),
+            "labels": torch.tensor([1, -100], dtype=torch.long),
+            "attention_mask": torch.tensor([1, 1], dtype=torch.long),
+            "images": [image_a],
+        },
+        {
+            "input_ids": torch.tensor([3], dtype=torch.long),
+            "labels": torch.tensor([-100], dtype=torch.long),
+            "attention_mask": torch.tensor([1], dtype=torch.long),
+            "images": [image_b],
+        },
+    ]
+
+    collated = collator(batch)
+
+    assert collated["input_ids"].shape == (2, 4)
+    assert collated["labels"].shape == (2, 4)
+    assert collated["attention_mask"].shape == (2, 4)
+    assert collated["images"].shape == (3, 3, 4, 4)
+    assert torch.equal(collated["images"], torch.cat([image_a, image_b], dim=0))
+
+
+def test_vqa_collator_returns_empty_image_tensor_for_empty_batch():
+    collator = VQACollator(SimpleNamespace(pad_token_id=0), max_length=2)
+
+    collated = collator([None])
+
+    assert collated["input_ids"] == []
+    assert collated["labels"] == []
+    assert collated["attention_mask"] == []
+    assert collated["images"].shape == (0, 3, 1, 1)

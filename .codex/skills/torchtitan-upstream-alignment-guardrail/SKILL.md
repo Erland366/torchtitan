@@ -85,6 +85,10 @@ or the input path before widening distributed/runtime changes.
 - Separate distributed-family benchmarking from dataloader diagnosis:
   - if built-in timing metrics show data loading dominating step time, treat
     dataloader optimization as the primary speed lever before revisiting DDP/FSDP
+- Treat packed-path defaults as benchmarkable policy, not sacred upstream truth:
+  - if packed runs are isolated regressions while non-packed runs are healthy,
+    it is acceptable to tune model-local packing buffer policy in the nanoVLM
+    dataloader/configs instead of widening shared-runtime changes
 - Separate correctness claims from parity claims:
   - a distributed structural fix can be correct while still causing small
     numerical drift in step-level parity benchmarks
