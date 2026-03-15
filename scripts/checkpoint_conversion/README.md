@@ -35,8 +35,8 @@ selected checkpoint paths and merge weights.
 
 For nanoVLM soft-gating checkpoints, the exported HF bundle preserves the
 per-layer `momh_gate` tensors so `scripts/nanovlm_downstream_eval.py` can use
-the TorchTitan fallback backend on merged exports without dropping soft-gating
-state.
+the default TorchTitan nanoVLM eval backend on merged exports without dropping
+soft-gating state.
 
 ## Methods
 

@@ -1,1 +1,2 @@
 commit	status	description
+bf9846f3	kept	2-step FSDP aux-loss repro passed: steps 1-2 completed under timeout 600 with compile enabled; first logged step at 11:16:38 UTC, job exited 0

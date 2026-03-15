@@ -304,8 +304,8 @@ Defaults:
 - tasks: `coco2017_cap_val,vqav2_val,ocrbench,scienceqa,docvqa_val`
 - limit: `2000`
 - batch size: `16`
-- raw backend: `huggingface`
-- fallback backend: `torchtitan_plugin`
+- primary backend: `torchtitan_nanovlm`
+- fallback backend: `none`
 - outputs: `eval_results/torchtitan/<run_name>/`
 
 Produced artifacts:
@@ -313,7 +313,7 @@ Produced artifacts:
 - `per_task.json`
 - `metadata.json`
 
-### Raw-first with explicit fallback
+### Default local backend
 
 Main script:
 
@@ -327,18 +327,38 @@ python scripts/nanovlm_downstream_eval.py \
   --tasks mmstar \
   --limit 100 \
   --batch_size 8 \
-  --model_backend huggingface \
-  --fallback_backend torchtitan_plugin \
   --output_dir eval_results/torchtitan
 ```
 
 Behavior:
-- tries raw lmms-eval backend first (`--model_backend`, default `huggingface`)
-- if raw load/eval fails and fallback is enabled, uses a TorchTitan-local
-  registration (`torchtitan_nanovlm`) implemented in `torchtitan.eval`
-- fallback backend uses prefill-once + KV-cache decode in eval runtime to avoid
-  full-sequence recomputation each generated token
-- records attempt outcomes and chosen backend in `metadata.json`
+- runs the TorchTitan-local lmms-eval registration (`torchtitan_nanovlm`) by
+  default
+- passes `model=/abs/path/to/checkpoint` to the backend instead of relying on
+  generic HF auto-loading
+- records the primary attempt and chosen backend in `metadata.json`
+
+### Explicit raw-HF compatibility check
+
+If you specifically want to test the generic lmms-eval Hugging Face path, opt
+into it explicitly:
+
+```bash
+source .venv/bin/activate
+cd /home/coder/edd/nanoVLM_root/torchtitan
+
+python scripts/nanovlm_downstream_eval.py \
+  --checkpoint_path /abs/path/to/checkpoint \
+  --checkpoint_format auto \
+  --tasks mmstar \
+  --limit 100 \
+  --batch_size 8 \
+  --model_backend huggingface \
+  --fallback_backend none \
+  --output_dir eval_results/torchtitan
+```
+
+Use `--fallback_backend torchtitan_plugin` only when you intentionally want a
+secondary retry path after a raw-HF failure.
 
 ### DCP Checkpoints
 

@@ -1,9 +1,8 @@
 ---
 name: torchtitan-downstream-eval-raw-first-fallback
 description: >
-  Run TorchTitan nanoVLM downstream evaluation with raw lmms-eval first and a
-  deterministic TorchTitan plugin fallback for local checkpoints that are not
-  complete HF processor bundles.
+  Run TorchTitan nanoVLM downstream evaluation with `torchtitan_nanovlm` as the
+  default backend and an optional explicit raw-HF compatibility path.
   Use when: evaluating checkpoints on mmstar/docvqa/vqav2 while preserving
   reproducible JSON artifacts and explicit backend provenance.
 metadata:
@@ -19,14 +18,14 @@ metadata:
   author: codex
 ---
 
-# TorchTitan Downstream Eval Raw-first Fallback
+# TorchTitan Downstream Eval Default Backend
 
 ## General Description
 
-This skill captures a stable downstream evaluation workflow for TorchTitan
-nanoVLM checkpoints. It attempts raw lmms-eval backend loading first and falls
-back to a TorchTitan-registered nanoVLM plugin when local checkpoints do not
-contain the full HF processor assets expected by raw backends.
+This skill captures the stable downstream evaluation workflow for TorchTitan
+nanoVLM checkpoints. The default path is the repo-local
+`torchtitan_nanovlm` lmms-eval backend. Raw `huggingface` loading is retained
+only as an explicit compatibility check when requested.
 
 It also enforces deterministic local outputs per run:
 - `summary.json`
@@ -66,40 +65,48 @@ Reference runs:
 - Preferred script: `scripts/nanovlm_downstream_eval.py`
 - Convenience wrapper: `evaluation_torchtitan.sh`
 
-### Step 2: Keep raw-first + fallback enabled
+### Step 2: Use `torchtitan_nanovlm` as the default local path
 
-- raw backend: `huggingface`
-- fallback backend: `torchtitan_plugin`
+- primary backend: `torchtitan_nanovlm`
+- fallback backend: `none`
 
-This preserves compatibility with future fully-HF-exported checkpoints while
-still succeeding today on local checkpoint folders that lack processor files.
+This is the one clear path for local TorchTitan nanoVLM checkpoints and merged
+exports.
 
-### Step 3: Preserve artifact provenance
+### Step 3: Use raw HF only as an explicit compatibility check
+
+When you want to probe generic lmms-eval Hugging Face loading, pass:
+- `--model_backend huggingface`
+- `--fallback_backend none`
+
+Only enable `--fallback_backend torchtitan_plugin` when you deliberately want a
+secondary retry path after a raw-HF failure.
+
+### Step 4: Preserve artifact provenance
 
 Always retain:
-- raw attempt outcome (`metadata.raw_attempt`)
+- primary attempt outcome (`metadata.primary_attempt`)
 - fallback attempt outcome (`metadata.fallback_attempt`)
 - final backend used (`metadata.backend_used`)
 
 These are required for fair result interpretation.
 
-### Step 4: Check backend provenance before reporting scores
+### Step 5: Check backend provenance before reporting scores
 
 For this checkpoint class, score interpretation is invalid without checking
-`metadata.backend_used`. A completed JSON artifact does not imply that the raw
-backend worked.
+`metadata.backend_used`. A completed JSON artifact does not imply that a raw-HF
+compatibility attempt worked.
 
-### Step 5: Prefer the cached TorchTitan fallback runtime
+### Step 6: Prefer the cached TorchTitan runtime
 
-If fallback is required, use the standalone TorchTitan backend with KV-cache
-decode support. It preserves `mmstar` scores while avoiding the older
-full-sequence recompute path.
+The standalone TorchTitan backend uses KV-cache decode support. It preserves
+`mmstar` scores while avoiding the older full-sequence recompute path.
 
 ## Failure Modes
 
 | What Failed | Why | Lesson Learned |
 |-------------|-----|----------------|
-| Raw `huggingface` backend load | Local checkpoint missing processor config files expected by `AutoProcessor.from_pretrained` | Keep fallback plugin on by default for this checkpoint class |
+| Raw `huggingface` backend load | Local checkpoint is not a reliable generic HF lmms-eval target for this model family | Keep `torchtitan_nanovlm` as the default local backend |
 | Standalone fallback took impractically long | Decode path recomputed full sequence and vision path each generated token | Keep KV-cache runtime enabled for fallback eval and regression-check score parity after any runtime rewrite |
 | Mixed concurrent eval processes with same run name | Two runs write into same output dir and make completion status ambiguous | Keep one canonical run process and avoid duplicate launches per run name |
 | Silent backend ambiguity | Score file exists but backend origin unclear | Enforce `metadata.json` backend provenance checks before reporting numbers |
@@ -116,8 +123,6 @@ python scripts/nanovlm_downstream_eval.py \
   --tasks mmstar \
   --batch_size 16 \
   --device cuda \
-  --model_backend huggingface \
-  --fallback_backend torchtitan_plugin \
   --output_dir eval_results/torchtitan
 ```
 

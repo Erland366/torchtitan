@@ -4,8 +4,8 @@
 Flow:
 1) Resolve checkpoint format (HF vs DCP).
 2) Convert DCP -> HF when needed.
-3) Try raw lmms-eval backend first.
-4) Optionally fallback to a thin TorchTitan-registered nanoVLM backend.
+3) Run the requested lmms-eval backend.
+4) Optionally try a secondary TorchTitan fallback backend.
 5) Save deterministic JSON artifacts.
 """
 
@@ -77,26 +77,26 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model_backend",
         type=str,
-        default="huggingface",
-        help="Raw lmms-eval model backend to try first.",
+        default="torchtitan_nanovlm",
+        help="Primary lmms-eval model backend. Default is the local TorchTitan nanoVLM backend.",
     )
     parser.add_argument(
         "--model_args",
         type=str,
         default="",
-        help="Additional model args appended to raw backend model_args.",
+        help="Additional model args appended to the primary backend model_args.",
     )
     parser.add_argument(
         "--fallback_backend",
         type=str,
         choices=["none", "torchtitan_plugin"],
-        default="torchtitan_plugin",
+        default="none",
     )
     parser.add_argument(
         "--fallback_model_args",
         type=str,
         default="",
-        help="Additional model args appended for fallback backend.",
+        help="Additional model args appended for the fallback backend.",
     )
     parser.add_argument(
         "--output_dir",
@@ -213,6 +213,17 @@ class EvalAttemptResult:
     error: str | None
     results: dict[str, Any] | None
     duration_sec: float
+
+
+def _resolve_eval_backend(
+    *,
+    backend: str,
+    eval_model_path: Path,
+    extra_model_args: str,
+) -> tuple[str, str | None]:
+    if backend == "torchtitan_nanovlm":
+        return _merge_model_args(f"model={eval_model_path}", extra_model_args), "torchtitan.eval"
+    return _merge_model_args(f"pretrained={eval_model_path}", extra_model_args), None
 
 
 def _run_lmms_simple_eval(
@@ -378,7 +389,7 @@ def main() -> int:
         "limit": args.limit,
         "batch_size": args.batch_size,
         "device": args.device,
-        "model_backend_raw": args.model_backend,
+        "model_backend_requested": args.model_backend,
         "fallback_backend": args.fallback_backend,
     }
 
@@ -411,31 +422,37 @@ def main() -> int:
             )
         eval_model_path = conversion_temp_dir
 
-    raw_model_args = _merge_model_args(
-        f"pretrained={eval_model_path}",
-        args.model_args,
+    primary_model_args, primary_plugins = _resolve_eval_backend(
+        backend=args.model_backend,
+        eval_model_path=eval_model_path,
+        extra_model_args=args.model_args,
     )
-    raw_attempt = _run_lmms_simple_eval(
+    primary_attempt = _run_lmms_simple_eval(
         model_name=args.model_backend,
-        model_args=raw_model_args,
+        model_args=primary_model_args,
         tasks=args.tasks,
         batch_size=args.batch_size,
         device=args.device,
         limit=args.limit,
         num_fewshot=args.num_fewshot,
         verbosity=args.verbosity,
+        lmms_plugins=primary_plugins,
     )
-    metadata["raw_attempt"] = {
-        "backend": raw_attempt.backend,
-        "ok": raw_attempt.ok,
-        "error": raw_attempt.error,
-        "duration_sec": raw_attempt.duration_sec,
-        "model_args": raw_attempt.model_args,
+    metadata["primary_attempt"] = {
+        "backend": primary_attempt.backend,
+        "ok": primary_attempt.ok,
+        "error": primary_attempt.error,
+        "duration_sec": primary_attempt.duration_sec,
+        "model_args": primary_attempt.model_args,
     }
 
-    chosen_attempt = raw_attempt
+    chosen_attempt = primary_attempt
     fallback_attempt: EvalAttemptResult | None = None
-    if not raw_attempt.ok and args.fallback_backend == "torchtitan_plugin":
+    if (
+        not primary_attempt.ok
+        and args.fallback_backend == "torchtitan_plugin"
+        and args.model_backend != "torchtitan_nanovlm"
+    ):
         fallback_model_args = _merge_model_args(
             f"model={eval_model_path}",
             args.fallback_model_args,
@@ -466,7 +483,7 @@ def main() -> int:
         _write_json(run_dir / "metadata.json", metadata)
         raise RuntimeError(
             "Evaluation failed.\n"
-            f"raw_error={raw_attempt.error}\n"
+            f"primary_error={primary_attempt.error}\n"
             f"fallback_error={fallback_attempt.error if fallback_attempt else None}"
         )
 

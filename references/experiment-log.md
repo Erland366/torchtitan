@@ -14,6 +14,72 @@ Each entry should include:
 
 <!-- New entries go above this line -->
 
+## 2026-03-15
+
+- **Date**: 2026-03-15
+- **Type**: Retrospective
+- **General description**: Compared three `3000`-step no-pack soft-gating WSM runs and found that the new balance variants trained stably but did not beat the plain soft-gating control on full `mmstar`, while the logged gate signals remained too weak to show strong actuation.
+- **Details**:
+  - Run matrix:
+    - hardware: `2x A100 40GB`
+    - distributed family: `FSDP`
+    - activation checkpointing: `full`
+    - `global_batch_size=64`
+    - `local_batch_size=32`
+    - `steps=3000`
+    - `checkpoint.interval=250`
+    - no packing
+  - Configs:
+    - control: `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm`
+    - controller: `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm`
+    - aux loss: `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_aux_wsm`
+  - WSM selection:
+    - merged the last four checkpoints from each run: `2250`, `2500`, `2750`, `3000`
+    - merge method: `mean`
+    - merged outputs:
+      - `outputs/wsm_softgating_3000_20260314_wandb/merged/s0_control_last4_mean`
+      - `outputs/wsm_softgating_3000_20260314_wandb/merged/s1_controller_last4_mean`
+      - `outputs/wsm_softgating_3000_20260314_wandb/merged/s2_aux_last4_mean`
+  - Full `mmstar` downstream eval on merged checkpoints:
+    - control:
+      - output: `eval_results/torchtitan/wsm-s0-control-mmstar-full-20260315-v1`
+      - backend: `torchtitan_nanovlm` fallback
+      - `average,none = 0.3624798405`
+    - controller:
+      - output: `eval_results/torchtitan/wsm-s1-controller-mmstar-full-20260315-v1`
+      - backend: `torchtitan_nanovlm` fallback
+      - `average,none = 0.3560083661`
+    - aux loss:
+      - output: `eval_results/torchtitan/wsm-s2-aux-mmstar-full-20260315-v1`
+      - backend: `torchtitan_nanovlm` fallback
+      - `average,none = 0.3538701372`
+  - Outcome:
+    - ranking on full `mmstar`: control > controller > aux loss
+    - the two new balance mechanisms did not improve downstream quality over the plain soft-gating WSM control
+  - Gate diagnostics:
+    - controller run summary:
+      - source: `outputs/wsm_softgating_3000_20260314_wandb/s1_controller/tb/20260314-2334/wandb/run-20260314_233404-4f7iu2qc/files/wandb-summary.json`
+      - average absolute `tv_error_mean` across layers: about `0.00012`
+      - max absolute `tv_error_mean`: about `0.00026`
+      - implied `tt` vs `tv` pair-logit separation stayed near zero, so the controller was effectively neutral
+    - aux-loss run summary:
+      - source: `outputs/wsm_softgating_3000_20260314_wandb/s2_aux/tb/20260315-1122/wandb/run-20260315_112232-vfp59yr1/files/wandb-summary.json`
+      - average absolute `tv_error_mean` across layers: about `0.00171`
+      - max absolute `tv_error_mean`: about `0.00461`
+      - average `momh_gate_effect/*/tt_tv_abs_mean` across layers: about `0.0128`
+      - strongest layer mean `tt-tv` bias gap: about `0.0287`
+      - strongest per-head absolute `tt-tv` gap: about `0.0573`
+      - aux loss moved the gate more than the controller, but still not enough to win downstream
+  - Implementation fix required during this experiment:
+    - aux-loss FSDP initially crashed because the balance-loss path mixed DTensor-backed gate state into the trainer loss path
+    - kept fix commit: `bf9846f3` (`localize aux balance loss under fsdp`)
+  - Decision:
+    - treat current controller and aux-loss variants as stable prototypes, not promoted recipes
+    - before another long soft-gating balance run, first screen actuation strength with short runs that sweep:
+      - `momh_soft_gating_scale`
+      - stronger warm initialization
+      - higher controller update rate
+
 ## 2026-03-13
 
 - **Date**: 2026-03-13
