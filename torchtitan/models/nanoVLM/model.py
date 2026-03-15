@@ -7,6 +7,7 @@ GQA decoder with MoMH attention, all in one file.
 
 import math
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -16,6 +17,7 @@ from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module
 
 from .attention import (
+    compute_tt_tv_balance_stats,
     create_base_structural_block_mask,
     create_causal_block_mask,
     create_momh_block_mask_from_modality,
@@ -347,6 +349,9 @@ class NanoVLMGQAttention(nn.Module):
         )
         self.momh_causal_gating = getattr(cfg, "momh_causal_gating", False)
         self.momh_soft_gating_pairs = getattr(cfg, "momh_soft_gating_pairs", "all")
+        self.momh_soft_gating_scale = float(
+            getattr(cfg, "momh_soft_gating_scale", 1.0)
+        )
         self.momh_gate_metrics_enabled = bool(
             getattr(cfg, "momh_gate_metrics_enabled", False)
         )
@@ -355,6 +360,17 @@ class NanoVLMGQAttention(nn.Module):
         )
         self.momh_gate_metrics_interval = int(
             getattr(cfg, "momh_gate_metrics_interval", 50)
+        )
+        self.momh_balance_mode = str(getattr(cfg, "momh_balance_mode", "off"))
+        self.momh_balance_signal = str(getattr(cfg, "momh_balance_signal", "gate_prob"))
+        self.momh_balance_target_tv = float(
+            getattr(cfg, "momh_balance_target_tv", 0.5)
+        )
+        self.momh_balance_aux_weight = float(
+            getattr(cfg, "momh_balance_aux_weight", 0.0)
+        )
+        self.momh_balance_update_rate = float(
+            getattr(cfg, "momh_balance_update_rate", 0.0)
         )
         self.momh_soft_gating = getattr(cfg, "momh_soft_gating", False)
         if self.momh_soft_gating:
@@ -390,6 +406,15 @@ class NanoVLMGQAttention(nn.Module):
         self.out_proj = nn.Linear(self.embd_dim, self.embd_dim, bias=False)
         self.attn_dropout = nn.Dropout(self.dropout)
         self.resid_dropout = nn.Dropout(self.dropout)
+
+    def compute_momh_balance_aux_loss(self) -> torch.Tensor | None:
+        if self.momh_balance_mode != "aux_loss" or not self.momh_soft_gating:
+            return None
+        _, _, balance_loss = compute_tt_tv_balance_stats(
+            self.momh_gate,
+            target_tv=self.momh_balance_target_tv,
+        )
+        return balance_loss
 
     def forward(
         self,
@@ -490,6 +515,7 @@ class NanoVLMGQAttention(nn.Module):
                 is_vision=is_vision[:, :T_kv],
                 q_offset=(T_kv - T_curr),
                 active_pairs=self.momh_soft_gating_pairs,
+                gate_scale=self.momh_soft_gating_scale,
             )
             target_dtype = q.dtype
             k_exp, v_exp = k_exp.to(target_dtype), v_exp.to(target_dtype)
@@ -628,6 +654,7 @@ class NanoVLMModel(BaseModel):
         momh_soft_gating: bool = False
         momh_soft_gating_init: str = "zero"
         momh_soft_gating_pairs: str = "all"
+        momh_soft_gating_scale: float = 1.0
         momh_structural_mask_only: bool = False
         momh_causal_gating: bool = False
         # Optional soft-gating diagnostics. Keep disabled by default to avoid
@@ -638,6 +665,12 @@ class NanoVLMModel(BaseModel):
         momh_gate_metrics_mode: str = "local"
         # Hook collection interval in optimizer steps when enabled.
         momh_gate_metrics_interval: int = 50
+        # Optional soft-gating balance control for the existing `tt_tv` path.
+        momh_balance_mode: Literal["off", "aux_loss", "controller"] = "off"
+        momh_balance_signal: Literal["gate_prob"] = "gate_prob"
+        momh_balance_target_tv: float = 0.5
+        momh_balance_aux_weight: float = 0.0
+        momh_balance_update_rate: float = 0.0
 
         # Identity (set during build from tokenizer)
         image_token_id: int = -1
@@ -659,6 +692,62 @@ class NanoVLMModel(BaseModel):
                     "momh_gate_metrics_interval must be > 0, "
                     f"got {self.momh_gate_metrics_interval}"
                 )
+            if self.momh_soft_gating_scale <= 0.0:
+                raise ValueError(
+                    "momh_soft_gating_scale must be > 0, "
+                    f"got {self.momh_soft_gating_scale}"
+                )
+            if self.momh_balance_mode not in {"off", "aux_loss", "controller"}:
+                raise ValueError(
+                    "momh_balance_mode must be one of {'off', 'aux_loss', 'controller'}, "
+                    f"got {self.momh_balance_mode!r}"
+                )
+            if self.momh_balance_signal != "gate_prob":
+                raise ValueError(
+                    "momh_balance_signal must be 'gate_prob', "
+                    f"got {self.momh_balance_signal!r}"
+                )
+            if not 0.0 <= self.momh_balance_target_tv <= 1.0:
+                raise ValueError(
+                    "momh_balance_target_tv must be in [0, 1], "
+                    f"got {self.momh_balance_target_tv}"
+                )
+            if self.momh_balance_aux_weight < 0.0:
+                raise ValueError(
+                    "momh_balance_aux_weight must be >= 0, "
+                    f"got {self.momh_balance_aux_weight}"
+                )
+            if self.momh_balance_update_rate < 0.0:
+                raise ValueError(
+                    "momh_balance_update_rate must be >= 0, "
+                    f"got {self.momh_balance_update_rate}"
+                )
+            if self.momh_balance_mode != "off":
+                if not self.momh_soft_gating:
+                    raise ValueError(
+                        "momh_balance_mode requires momh_soft_gating=True"
+                    )
+                if self.momh_soft_gating_pairs != "tt_tv":
+                    raise ValueError(
+                        "momh_balance_mode currently supports only "
+                        "momh_soft_gating_pairs='tt_tv'"
+                    )
+                if (
+                    self.momh_balance_mode == "aux_loss"
+                    and self.momh_balance_aux_weight == 0.0
+                ):
+                    raise ValueError(
+                        "momh_balance_aux_weight must be > 0 when "
+                        "momh_balance_mode='aux_loss'"
+                    )
+                if (
+                    self.momh_balance_mode == "controller"
+                    and self.momh_balance_update_rate == 0.0
+                ):
+                    raise ValueError(
+                        "momh_balance_update_rate must be > 0 when "
+                        "momh_balance_mode='controller'"
+                    )
 
         def get_nparams_and_flops(
             self, model: Module, seq_len: int
@@ -703,6 +792,7 @@ class NanoVLMModel(BaseModel):
         # Weight tying
         if config.lm_tie_weights:
             self.output.weight = self.tok_embeddings.weight
+        self._momh_balance_aux_loss: torch.Tensor | None = None
 
     def init_weights(self, **kwargs):
         # Vision encoder
@@ -782,6 +872,7 @@ class NanoVLMModel(BaseModel):
         Returns:
             logits: [B, seq_len, vocab_size]
         """
+        self._momh_balance_aux_loss = None
         is_vision = tokens == self.image_token_id
 
         # Build MoMH block mask once (outside compiled blocks)
@@ -845,7 +936,21 @@ class NanoVLMModel(BaseModel):
                 is_vision=is_vision,
             )
 
+        if self.config.momh_balance_mode == "aux_loss":
+            aux_losses = []
+            for layer in self.layers.values():
+                balance_loss = layer.attn.compute_momh_balance_aux_loss()
+                if balance_loss is not None:
+                    aux_losses.append(balance_loss)
+            if aux_losses:
+                self._momh_balance_aux_loss = torch.stack(aux_losses).mean()
+
         # Final norm + LM head
         h = self.norm(h)
         logits = self.output(h)
         return logits
+
+    def consume_momh_balance_aux_loss(self) -> torch.Tensor | None:
+        loss = self._momh_balance_aux_loss
+        self._momh_balance_aux_loss = None
+        return loss

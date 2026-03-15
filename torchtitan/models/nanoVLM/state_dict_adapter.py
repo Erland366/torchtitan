@@ -65,10 +65,6 @@ class NanoVLMStateDictAdapter(BaseStateDictAdapter):
             if key == "rotary_embd.inv_freq":
                 hf_sd["decoder.rotary_embd.inv_freq"] = tensor
                 continue
-            # Skip MoMH soft-gating params (not present in vanilla checkpoints).
-            if ".momh_gate" in key:
-                continue
-
             # --- Decoder mappings ---
             tie_weights = getattr(self.model_config, "lm_tie_weights", True)
             if key == "tok_embeddings.weight":

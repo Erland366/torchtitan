@@ -4,6 +4,40 @@ When converting checkpoints between file types or model definitions, we need to 
 
 This guide provides a general framework on how to test your conversion script for correctness. The example that we will use here is bidirectional conversion between HuggingFace and `torchtitan`.
 
+## WSM offline merge
+
+For nanoVLM WSM experiments, use `scripts/checkpoint_conversion/merge_to_hf.py`
+to merge multiple TorchTitan DCP checkpoints into one HF-style export. This v1
+path is intended for offline `Warmup-Stable-and-Merge` workflows:
+
+- train with warmup + stable LR
+- save periodic TorchTitan checkpoints
+- merge the latest `N` checkpoints with `mean`, `linear`, `cosine`, or
+  `inv_sqrt` weighting
+- evaluate the merged HF bundle with the existing downstream tooling
+
+Example:
+
+```bash
+source ../nanoVLM_main/.venv/bin/activate && \
+python scripts/checkpoint_conversion/merge_to_hf.py \
+  ./outputs/merged_nanovlm_wsm \
+  --checkpoint_dir ./outputs/checkpoint_nanovlm_230m_vanilla_finevisionmax_nopack_wsm \
+  --last_n 4 \
+  --model_name nanoVLM \
+  --model_flavor 230m_vanilla \
+  --hf_assets_path ./tests/assets/tokenizer \
+  --merge_method mean
+```
+
+The merged output directory also includes `wsm_merge_metadata.json` with the
+selected checkpoint paths and merge weights.
+
+For nanoVLM soft-gating checkpoints, the exported HF bundle preserves the
+per-layer `momh_gate` tensors so `scripts/nanovlm_downstream_eval.py` can use
+the TorchTitan fallback backend on merged exports without dropping soft-gating
+state.
+
 ## Methods
 
 ### Sanity Check (Greedy Decode)

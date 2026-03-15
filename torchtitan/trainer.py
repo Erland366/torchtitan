@@ -213,6 +213,7 @@ class Trainer(
     step: int
     ntokens_seen: int
     nanovlm_effective_tokens_seen: int
+    nanovlm_balance_aux_loss_last: float | None
 
     # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
     @record
@@ -280,6 +281,14 @@ class Trainer(
             trainer_config=config,
         )
         self.model_config = model_config
+        if (
+            model_spec.name == "nanoVLM"
+            and getattr(model_config, "momh_balance_mode", "off") != "off"
+            and parallel_dims.pp_enabled
+        ):
+            raise ValueError(
+                "nanoVLM soft-gating balance modes do not support pipeline parallelism"
+            )
 
         logger.info(
             f"Building {model_spec.name} {model_spec.flavor} "
@@ -466,6 +475,7 @@ class Trainer(
         self.step = 0
         self.ntokens_seen = 0
         self.nanovlm_effective_tokens_seen = 0
+        self.nanovlm_balance_aux_loss_last = None
         self._is_nanovlm = model_spec.name == "nanoVLM"
         self._reset_nanovlm_training_stats_window()
 
@@ -753,10 +763,31 @@ class Trainer(
                     pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
                     # Compute loss sum (reduction='sum')
                     loss_sum = self.loss_fn(pred, labels)
+                    balance_loss = None
+                    consume_balance_loss = getattr(
+                        model_parts[0], "consume_momh_balance_aux_loss", None
+                    )
+                    if callable(consume_balance_loss):
+                        balance_loss = consume_balance_loss()
 
                     # Scale the loss by the inverse of the total weight denominator before backward
                     # This ensures gradients are properly normalized across all microbatches
                     loss = loss_sum / global_valid_tokens
+                    if balance_loss is not None:
+                        self.nanovlm_balance_aux_loss_last = float(
+                            balance_loss.detach().item()
+                        )
+                        balance_weight = float(
+                            getattr(
+                                getattr(model_parts[0], "config", None),
+                                "momh_balance_aux_weight",
+                                0.0,
+                            )
+                        )
+                        loss = loss + (
+                            balance_loss * balance_weight
+                            / float(self.gradient_accumulation_steps)
+                        )
 
                 # need to free pred before bwd to avoid peaking memory
                 del pred
@@ -769,6 +800,7 @@ class Trainer(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
         self.optimizers.zero_grad()
+        self.nanovlm_balance_aux_loss_last = None
         # Save the current step learning rate for logging
         lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
 
@@ -929,6 +961,10 @@ class Trainer(
             "n_tokens_seen": global_ntokens_seen,
             "lr": lr,
         }
+        if self.nanovlm_balance_aux_loss_last is not None:
+            extra_metrics["train/momh_balance_aux_loss"] = float(
+                self.nanovlm_balance_aux_loss_last
+            )
 
         if self._is_nanovlm:
             if parallel_dims.dp_cp_enabled:

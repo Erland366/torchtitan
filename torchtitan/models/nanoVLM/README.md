@@ -95,6 +95,30 @@ The paper configs now use config-specific checkpoint folders and keep final save
 native DCP format (`last_save_in_hf=False`) so training resume behavior stays
 consistent.
 
+## Offline WSM Notes
+
+The repo now has an offline `WSM` entry point for nanoVLM. In v1 this is
+explicitly **not** a trainer rewrite:
+
+- training still uses the existing scheduler stack
+- WSM configs implement "warmup then stable LR" by setting `decay_ratio=0.0`
+- checkpoint merging happens offline from saved TorchTitan checkpoints
+
+Relevant nanoVLM config variants:
+
+- `nanovlm_230m_vanilla_finevisionmax_nopack_wsm`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm`
+- `nanovlm_230m_vanilla_finevisionmax_nopack_wsm_debug`
+
+Operational guidance:
+
+- treat merge duration / latest-`N` checkpoint selection as the primary WSM knob
+- keep checkpoint folders separate from non-WSM recipes
+- use the checkpoint-conversion merge script to emit a merged HF-style checkpoint
+  for downstream evaluation
+- the merge script writes `wsm_merge_metadata.json` alongside the merged model so
+  checkpoint provenance and weights stay reproducible
+
 ## FSDP Tied-Weight Note
 
 When `lm_tie_weights=True`, nanoVLM keeps `tok_embeddings`, `norm`, and `output`
@@ -111,6 +135,9 @@ When exporting nanoVLM checkpoints from TorchTitan to HF/nanoVLM safetensors:
   (`decoder.head.weight`). `decoder.token_embedding.weight` is intentionally not
   duplicated in tied mode, because nanoVLM strict loading can treat that alias as
   an unexpected key.
+- Soft-gating checkpoints keep per-layer `decoder.blocks.*.attn.momh_gate`
+  tensors in the exported safetensors bundle so TorchTitan downstream fallback
+  eval can round-trip those weights back into the native model.
 - `scripts/checkpoint_conversion/convert_to_hf.py --model_name nanoVLM ...` now
   emits `config.json` and `model.safetensors` directly in the output folder, so
   `nanoVLM_main/evaluation.py --mode nanovlm --model <output_dir>` works without
@@ -164,11 +191,50 @@ variants:
 - `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_gating_metrics_global_step`
 - `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_gating_metrics_local_sparse`
 - `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_gating_metrics_global_sparse`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_aux`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_aux_wsm`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm`
 
 Operational guidance:
 - keep gate metrics disabled for throughput-focused FSDP runs
 - use local sparse mode for low-overhead diagnostics
 - use global mode only when exact all-rank gate means are required
+- the `_wsm` balance variants keep sparse local gate metrics and a checkpoint
+  interval tuned for offline merge-window comparisons
+
+### Optional soft-gating balance controls
+
+The `tt_tv` soft-gating path now has opt-in balance controls that operate on the
+learnable gate proxy instead of instrumenting realized attention mass:
+
+- `momh_soft_gating_scale`: multiplies the gate bias before it perturbs the
+  attention score, so the same learned/controller gate can have a stronger or
+  weaker effect on the realized attention logits
+- `momh_balance_mode`: `"off"`, `"aux_loss"`, or `"controller"`
+- `momh_balance_signal`: currently only `"gate_prob"`
+- `momh_balance_target_tv`: target `tv` probability for the active `tt`/`tv` pair
+- `momh_balance_aux_weight`: auxiliary-loss weight when mode is `"aux_loss"`
+- `momh_balance_update_rate`: non-gradient post-step update size when mode is `"controller"`
+
+Current limitations:
+- balance mode requires `momh_soft_gating=True`
+- balance mode requires `momh_soft_gating_pairs="tt_tv"`
+- balance mode is not supported with pipeline parallelism
+- v1 balances the gate proxy only; it does not recover runtime attention-pair usage
+- `momh_soft_gating_scale` changes how strongly the gate affects attention, but
+  the balance controller still reads the raw `tt`/`tv` gate proxy, so controller
+  tuning and attention-strength tuning remain separate knobs
+
+Logged diagnostics include:
+- `train/momh_balance_aux_loss` for auxiliary-loss runs
+- `momh_balance/layer_*/tt_prob_mean`
+- `momh_balance/layer_*/tv_prob_mean`
+- `momh_balance/layer_*/tv_error_mean`
+- `momh_balance/layer_*/aux_loss_mean`
+- `momh_gate_effect/layer_*/tt_tv_abs_mean`
+- `momh_gate_effect/layer_*/tt_tv_abs_max`
+- `momh_gate_effect/layer_*/scale`
 
 ## 100-Step A/B Parity Benchmark
 

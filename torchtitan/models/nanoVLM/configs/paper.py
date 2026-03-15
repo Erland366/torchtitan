@@ -69,6 +69,25 @@ def _with_model_overrides(
     return cfg
 
 
+def _with_wsm_schedule(
+    cfg: Trainer.Config,
+    *,
+    checkpoint_folder: str,
+    checkpoint_interval: int,
+) -> Trainer.Config:
+    """Convert an existing config into a stable-LR WSM training recipe."""
+    cfg.lr_scheduler = dataclasses.replace(
+        cfg.lr_scheduler,
+        decay_ratio=0.0,
+    )
+    cfg.checkpoint = dataclasses.replace(
+        cfg.checkpoint,
+        folder=checkpoint_folder,
+        interval=checkpoint_interval,
+    )
+    return cfg
+
+
 def _resolve_hf_repo(repo_id: str) -> str:
     """Resolve an HF repo ID to a local cache directory."""
     return snapshot_download(repo_id)
@@ -246,6 +265,16 @@ def nanovlm_230m_vanilla_finevisionmax_nopack() -> Trainer.Config:
         ),
         compile=_compile_model_and_loss(),
         debug=DebugConfig(seed=0),
+    )
+
+
+def nanovlm_230m_vanilla_finevisionmax_nopack_wsm() -> Trainer.Config:
+    """230M vanilla FineVisionMax recipe with warmup + stable LR for WSM."""
+    cfg = nanovlm_230m_vanilla_finevisionmax_nopack()
+    return _with_wsm_schedule(
+        cfg,
+        checkpoint_folder="checkpoint_nanovlm_230m_vanilla_finevisionmax_nopack_wsm",
+        checkpoint_interval=250,
     )
 
 
@@ -444,6 +473,16 @@ def nanovlm_230m_momh_soft_gating_b5_tttv_nopack() -> Trainer.Config:
     return cfg
 
 
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm() -> Trainer.Config:
+    """Soft-gating paper recipe with warmup + stable LR for offline WSM."""
+    cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack()
+    return _with_wsm_schedule(
+        cfg,
+        checkpoint_folder="checkpoint_nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm",
+        checkpoint_interval=250,
+    )
+
+
 def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_gating_metrics_global_step() -> Trainer.Config:
     """Soft-gating config with globally synchronized gate metrics every step."""
     cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack()
@@ -474,6 +513,65 @@ def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_gating_metrics_global_sparse() 
         momh_gate_metrics_enabled=True,
         momh_gate_metrics_mode="global",
         momh_gate_metrics_interval=50,
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_aux() -> Trainer.Config:
+    """Soft-gating config with `tt`/`tv` auxiliary balance loss diagnostics."""
+    cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack()
+    return _with_model_overrides(
+        cfg,
+        momh_gate_metrics_enabled=True,
+        momh_gate_metrics_mode="local",
+        momh_gate_metrics_interval=1,
+        momh_balance_mode="aux_loss",
+        momh_balance_signal="gate_prob",
+        momh_balance_target_tv=0.5,
+        momh_balance_aux_weight=0.01,
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_aux_wsm() -> Trainer.Config:
+    """Soft-gating aux-balance recipe with sparse diagnostics and WSM schedule."""
+    cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_aux()
+    cfg = _with_model_overrides(
+        cfg,
+        momh_gate_metrics_interval=50,
+    )
+    return _with_wsm_schedule(
+        cfg,
+        checkpoint_folder="checkpoint_nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_aux_wsm",
+        checkpoint_interval=250,
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller() -> Trainer.Config:
+    """Soft-gating config with non-gradient `tt`/`tv` balance controller."""
+    cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack()
+    return _with_model_overrides(
+        cfg,
+        momh_gate_metrics_enabled=True,
+        momh_gate_metrics_mode="local",
+        momh_gate_metrics_interval=1,
+        momh_balance_mode="controller",
+        momh_balance_signal="gate_prob",
+        momh_balance_target_tv=0.5,
+        momh_balance_update_rate=0.01,
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm() -> Trainer.Config:
+    """Soft-gating controller recipe with sparse diagnostics and WSM schedule."""
+    cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller()
+    cfg = _with_model_overrides(
+        cfg,
+        momh_gate_metrics_interval=50,
+        momh_balance_update_rate=0.001,
+    )
+    return _with_wsm_schedule(
+        cfg,
+        checkpoint_folder="checkpoint_nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm",
+        checkpoint_interval=250,
     )
 
 

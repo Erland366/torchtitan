@@ -24,6 +24,51 @@ flex_attention_compiled_dynamic = torch.compile(flex_attention, dynamic=True)
 # Increase dynamo cache for multiple mask configurations
 torch._dynamo.config.cache_size_limit = 1000
 
+_TT_PAIR_INDEX = 0
+_TV_PAIR_INDEX = 1
+
+
+def get_tt_tv_pair_logits(momh_gate: torch.Tensor) -> torch.Tensor:
+    """Return the active `tt`/`tv` pair logits without advanced indexing.
+
+    DTensor currently rejects mixed advanced indexing patterns like
+    ``tensor[:, [0, 1]]`` inside distributed operators. Stacking the two
+    columns keeps the operation slice-based and works for both local tensors
+    and DTensor-backed parameters.
+    """
+    if momh_gate.ndim != 2 or momh_gate.shape[1] < 2:
+        raise ValueError(
+            f"momh_gate must have shape [n_heads, >=2], got {tuple(momh_gate.shape)}"
+        )
+    return torch.stack(
+        (
+            momh_gate[:, _TT_PAIR_INDEX],
+            momh_gate[:, _TV_PAIR_INDEX],
+        ),
+        dim=-1,
+    )
+
+
+def compute_tt_tv_balance_stats(
+    momh_gate: torch.Tensor,
+    *,
+    target_tv: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute `tt`/`tv` balance stats from soft-gating parameters.
+
+    Returns per-head probabilities for the `tt` and `tv` columns plus a
+    differentiable mean-squared balance loss against the requested `tv` target.
+    This intentionally uses only the active `tt`/`tv` slice and does not try to
+    recover runtime attention mass from flex attention internals.
+    """
+    pair_logits = get_tt_tv_pair_logits(momh_gate)
+    pair_probs = torch.softmax(pair_logits.float(), dim=-1)
+    tt_prob = pair_probs[:, 0]
+    tv_prob = pair_probs[:, 1]
+    target = torch.full_like(tv_prob, float(target_tv))
+    balance_loss = torch.mean((tv_prob - target) ** 2)
+    return tt_prob, tv_prob, balance_loss
+
 
 def warmup_flex_attention_compile(
     *,
@@ -373,6 +418,7 @@ def generate_soft_gating_score_mod(
     is_vision,
     q_offset=0,
     active_pairs="all",
+    gate_scale: float = 1.0,
 ):
     """
     Generate a score_mod that adds learnable per-head modality bias.
@@ -386,15 +432,21 @@ def generate_soft_gating_score_mod(
         is_vision: Bool tensor [B, KV_LEN] marking vision tokens.
         q_offset: Offset to map local q_idx into absolute KV positions.
         active_pairs: "all" for all 4 pairs, "tt_tv" for text-query pairs only.
+        gate_scale: Multiplier applied to the gate bias before it perturbs the
+            attention score. This strengthens or weakens the realized effect of
+            a given gate value without changing the underlying gate parameter.
 
     Returns:
         score_mod function for flex_attention.
     """
     if is_vision.dtype is not torch.bool:
         is_vision = is_vision.to(torch.bool)
+    if gate_scale <= 0.0:
+        raise ValueError(f"gate_scale must be > 0, got {gate_scale}")
 
     B_size, kv_len = is_vision.shape
     n_heads = momh_gate.shape[0]
+    scaled_gate = momh_gate * float(gate_scale)
 
     # Precompute bias tables
     kv_mod = is_vision.to(torch.int64)  # [B, KV_LEN]
@@ -411,10 +463,10 @@ def generate_soft_gating_score_mod(
         pair_idx_q_vis.unsqueeze(0).expand(n_heads, -1, -1).reshape(n_heads, -1)
     )
 
-    bias_if_q_text = momh_gate.gather(1, pair_q_text_flat).reshape(
+    bias_if_q_text = scaled_gate.gather(1, pair_q_text_flat).reshape(
         n_heads, B_size, kv_len
     )
-    bias_if_q_vis = momh_gate.gather(1, pair_q_vis_flat).reshape(
+    bias_if_q_vis = scaled_gate.gather(1, pair_q_vis_flat).reshape(
         n_heads, B_size, kv_len
     )
 

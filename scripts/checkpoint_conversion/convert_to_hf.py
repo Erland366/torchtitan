@@ -97,14 +97,11 @@ def _emit_nanovlm_bundle(output_dir: Path, model_config) -> None:
     shutil.copyfile(shard_files[0], single_file)
 
 
-@torch.inference_mode()
-def convert_to_hf(
-    input_dir,
-    output_dir,
-    model_name,
-    model_flavor,
-    hf_assets_path,
-    export_dtype,
+def build_model_wrapper_and_adapter(
+    *,
+    model_name: str,
+    model_flavor: str,
+    hf_assets_path: str | Path,
 ):
     # load model and model args so that we can get the state dict shape
     model_module = importlib.import_module(f"torchtitan.models.{model_name}")
@@ -121,15 +118,32 @@ def convert_to_hf(
         sd_adapter is not None
     ), "trying to convert checkpoint from DCP to HF safetensors format, but sd_adapter is not provided."
 
-    # allocate state dict memory with empty weights to load checkpoint
-    state_dict = model._get_state_dict()
+    return model, model_config, sd_adapter
+
+
+def load_tt_model_state_dict(input_dir: str | Path, model: ModelWrapper) -> dict[str, torch.Tensor]:
+    state_dict = {
+        key: torch.empty_like(value, device="cpu")
+        for key, value in model._get_state_dict().items()
+    }
     dcp.load(
         state_dict,
         checkpoint_id=input_dir,
     )
+    return state_dict
 
-    # convert state dict tt->hf
-    hf_state_dict = sd_adapter.to_hf(state_dict)
+
+def save_hf_state_dict(
+    *,
+    output_dir: str | Path,
+    hf_state_dict: dict[str, torch.Tensor],
+    sd_adapter,
+    model_name: str,
+    model_config,
+    export_dtype: str,
+) -> None:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     storage_writer = HuggingFaceStorageWriter(
         path=output_dir,
@@ -150,7 +164,38 @@ def convert_to_hf(
     )
 
     if model_name == "nanoVLM":
-        _emit_nanovlm_bundle(Path(output_dir), model_config)
+        _emit_nanovlm_bundle(output_dir, model_config)
+
+
+@torch.inference_mode()
+def convert_to_hf(
+    input_dir,
+    output_dir,
+    model_name,
+    model_flavor,
+    hf_assets_path,
+    export_dtype,
+):
+    model, model_config, sd_adapter = build_model_wrapper_and_adapter(
+        model_name=model_name,
+        model_flavor=model_flavor,
+        hf_assets_path=hf_assets_path,
+    )
+
+    # allocate state dict memory with empty weights to load checkpoint
+    state_dict = load_tt_model_state_dict(input_dir, model)
+
+    # convert state dict tt->hf
+    hf_state_dict = sd_adapter.to_hf(state_dict)
+
+    save_hf_state_dict(
+        output_dir=output_dir,
+        hf_state_dict=hf_state_dict,
+        sd_adapter=sd_adapter,
+        model_name=model_name,
+        model_config=model_config,
+        export_dtype=export_dtype,
+    )
 
 
 if __name__ == "__main__":
