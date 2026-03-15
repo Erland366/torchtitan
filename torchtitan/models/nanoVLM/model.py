@@ -410,11 +410,22 @@ class NanoVLMGQAttention(nn.Module):
     def compute_momh_balance_aux_loss(self) -> torch.Tensor | None:
         if self.momh_balance_mode != "aux_loss" or not self.momh_soft_gating:
             return None
-        _, _, balance_loss = compute_tt_tv_balance_stats(
-            self.momh_gate,
+        gate = self.momh_gate
+        if hasattr(gate, "to_local"):
+            gate = gate.to_local()
+        if gate.numel() == 0:
+            return torch.zeros((), device=self.momh_gate.device, dtype=torch.float32)
+
+        _, tv_prob, _ = compute_tt_tv_balance_stats(
+            gate,
             target_tv=self.momh_balance_target_tv,
         )
-        return balance_loss
+        target = torch.full_like(tv_prob, self.momh_balance_target_tv)
+        # Under FSDP the gate parameter may be sharded by head. Compute the
+        # auxiliary penalty on the local shard only, but normalize by the total
+        # per-layer head count so the summed per-rank contribution matches the
+        # original full-parameter mean objective.
+        return torch.sum((tv_prob - target) ** 2) / float(self.n_heads)
 
     def forward(
         self,

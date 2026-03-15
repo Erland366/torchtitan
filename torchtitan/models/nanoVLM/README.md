@@ -225,6 +225,9 @@ Current limitations:
 - `momh_soft_gating_scale` changes how strongly the gate affects attention, but
   the balance controller still reads the raw `tt`/`tv` gate proxy, so controller
   tuning and attention-strength tuning remain separate knobs
+- under FSDP, aux-loss uses the local `momh_gate` shard and normalizes by the
+  total layer head count so it avoids mixing DTensor scalars into the trainer's
+  main loss path
 
 Logged diagnostics include:
 - `train/momh_balance_aux_loss` for auxiliary-loss runs
