@@ -69,6 +69,8 @@ def nanovlm_post_optimizer_build_fn(
             zero1.clone(),
             zero1.clone(),
             zero1.clone(),
+            zero1.clone(),
+            zero1.clone(),
         )
 
     def _local_gate_stats(
@@ -87,8 +89,10 @@ def nanovlm_post_optimizer_build_fn(
             target_tv=target_tv,
         )
         pair_logits = get_tt_tv_pair_logits(gate).float()
-        abs_pair_delta = torch.abs(pair_logits[:, 1] - pair_logits[:, 0])
-        effective_abs_pair_delta = abs_pair_delta * float(gate_scale)
+        effective_signed_pair_delta = (
+            pair_logits[:, 1] - pair_logits[:, 0]
+        ) * float(gate_scale)
+        effective_abs_pair_delta = torch.abs(effective_signed_pair_delta)
         return (
             probs.sum(dim=0),
             torch.tensor([float(probs.size(0))], device=probs.device, dtype=torch.float32),
@@ -114,6 +118,16 @@ def nanovlm_post_optimizer_build_fn(
                 device=probs.device,
                 dtype=torch.float32,
             ),
+            torch.tensor(
+                [float(effective_signed_pair_delta.sum().item())],
+                device=probs.device,
+                dtype=torch.float32,
+            ),
+            torch.tensor(
+                [float(torch.sum(effective_signed_pair_delta**2).item())],
+                device=probs.device,
+                dtype=torch.float32,
+            ),
         )
 
     def _collect_momh_gate_metrics(*args, **kwargs):
@@ -136,6 +150,7 @@ def nanovlm_post_optimizer_build_fn(
             controller_enabled = balance_mode == "controller"
             target_tv = float(first_block.attn.momh_balance_target_tv)
             gate_scale = float(first_block.attn.momh_soft_gating_scale)
+            balance_signal = str(getattr(first_block.attn, "momh_balance_signal", "gate_prob"))
 
             metrics_mode = str(getattr(first_block.attn, "momh_gate_metrics_mode", "local"))
             if metrics_mode not in {"local", "global"}:
@@ -168,8 +183,25 @@ def nanovlm_post_optimizer_build_fn(
                         gate_data.detach(),
                         target_tv=target_tv,
                     )
-                    direction = torch.sign(target_tv - tv_prob_local).to(gate_data.dtype)
-                    updates = direction * float(first_block.attn.momh_balance_update_rate)
+                    if balance_signal == "gate_prob":
+                        updates = torch.sign(target_tv - tv_prob_local).to(
+                            gate_data.dtype
+                        ) * float(first_block.attn.momh_balance_update_rate)
+                    elif balance_signal == "layer_mean_gate_prob":
+                        mean_error = float(target_tv - tv_prob_local.mean().item())
+                        updates = torch.full(
+                            (gate_data.shape[0],),
+                            float(first_block.attn.momh_balance_update_rate)
+                            * mean_error,
+                            device=gate_data.device,
+                            dtype=gate_data.dtype,
+                        )
+                    else:
+                        raise ValueError(
+                            "momh_balance_signal must be one of "
+                            "{'gate_prob', 'layer_mean_gate_prob'}, "
+                            f"got {balance_signal!r}"
+                        )
                     gate_data[:, 0].sub_(updates)
                     gate_data[:, 1].add_(updates)
 
@@ -188,6 +220,8 @@ def nanovlm_post_optimizer_build_fn(
                     local_tv_error_sum,
                     local_effective_abs_delta_sum,
                     local_effective_abs_delta_max,
+                    local_effective_signed_delta_sum,
+                    local_effective_signed_delta_sq_sum,
                 ) = _local_gate_stats(
                     gate,
                     device=gate_param.device,
@@ -197,7 +231,17 @@ def nanovlm_post_optimizer_build_fn(
 
                 if metrics_mode == "global" and torch.distributed.is_initialized():
                     sum_stats = torch.cat(
-                        [local_sum, local_count, local_tt_sum, local_tv_sum, local_balance_sum, local_tv_error_sum, local_effective_abs_delta_sum],
+                        [
+                            local_sum,
+                            local_count,
+                            local_tt_sum,
+                            local_tv_sum,
+                            local_balance_sum,
+                            local_tv_error_sum,
+                            local_effective_abs_delta_sum,
+                            local_effective_signed_delta_sum,
+                            local_effective_signed_delta_sq_sum,
+                        ],
                         dim=0,
                     )
                     torch.distributed.all_reduce(
@@ -214,6 +258,8 @@ def nanovlm_post_optimizer_build_fn(
                     global_balance_sum = float(sum_stats[7].item())
                     global_tv_error_sum = float(sum_stats[8].item())
                     global_effective_abs_delta_sum = float(sum_stats[9].item())
+                    global_effective_signed_delta_sum = float(sum_stats[10].item())
+                    global_effective_signed_delta_sq_sum = float(sum_stats[11].item())
                     global_effective_abs_delta_max = float(max_stats[0].item())
                 else:
                     global_sum = local_sum
@@ -225,11 +271,23 @@ def nanovlm_post_optimizer_build_fn(
                     global_effective_abs_delta_sum = float(
                         local_effective_abs_delta_sum.item()
                     )
+                    global_effective_signed_delta_sum = float(
+                        local_effective_signed_delta_sum.item()
+                    )
+                    global_effective_signed_delta_sq_sum = float(
+                        local_effective_signed_delta_sq_sum.item()
+                    )
                     global_effective_abs_delta_max = float(
                         local_effective_abs_delta_max.item()
                     )
 
                 if rank == 0 and global_count > 0.0:
+                    signed_mean = global_effective_signed_delta_sum / global_count
+                    signed_var = max(
+                        (global_effective_signed_delta_sq_sum / global_count)
+                        - (signed_mean * signed_mean),
+                        0.0,
+                    )
                     for pair_idx, pair_name in enumerate(pair_names):
                         extra[f"momh_gate/layer_{layer_idx}/{pair_name}_mean"] = float(
                             global_sum[pair_idx].item() / global_count
@@ -252,6 +310,12 @@ def nanovlm_post_optimizer_build_fn(
                     extra[
                         f"momh_gate_effect/layer_{layer_idx}/tt_tv_abs_max"
                     ] = global_effective_abs_delta_max
+                    extra[
+                        f"momh_gate_effect/layer_{layer_idx}/tt_tv_signed_mean"
+                    ] = signed_mean
+                    extra[
+                        f"momh_gate_effect/layer_{layer_idx}/tt_tv_signed_std"
+                    ] = signed_var**0.5
                     extra[f"momh_gate_effect/layer_{layer_idx}/scale"] = gate_scale
 
             if rank == 0:

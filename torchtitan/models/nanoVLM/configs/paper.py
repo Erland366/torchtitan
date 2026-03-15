@@ -88,6 +88,98 @@ def _with_wsm_schedule(
     return cfg
 
 
+def _with_frozen_momh_gate(cfg: Trainer.Config) -> Trainer.Config:
+    """Freeze soft-gating parameters out of LM-gradient updates."""
+    cfg.optimizer = dataclasses.replace(
+        cfg.optimizer,
+        lr_momh_gate=0.0,
+    )
+    return cfg
+
+
+def _with_controller_actuation_screen(
+    cfg: Trainer.Config,
+    *,
+    scale: float,
+    checkpoint_folder: str,
+    **model_overrides,
+) -> Trainer.Config:
+    """Convert a controller WSM config into a 100-step actuation screen."""
+    cfg = _with_model_overrides(
+        cfg,
+        momh_gate_metrics_interval=10,
+        momh_soft_gating_scale=scale,
+        **model_overrides,
+    )
+    cfg.training = dataclasses.replace(
+        cfg.training,
+        steps=100,
+        local_batch_size=32,
+        global_batch_size=64,
+    )
+    cfg.metrics = dataclasses.replace(
+        cfg.metrics,
+        log_freq=10,
+        enable_wandb=True,
+    )
+    cfg.parallelism = dataclasses.replace(
+        cfg.parallelism,
+        data_parallel_replicate_degree=1,
+        data_parallel_shard_degree=2,
+    )
+    cfg.activation_checkpoint = dataclasses.replace(
+        cfg.activation_checkpoint,
+        mode="full",
+    )
+    cfg.checkpoint = dataclasses.replace(
+        cfg.checkpoint,
+        enable=False,
+        folder=checkpoint_folder,
+        interval=100,
+    )
+    return cfg
+
+
+def _controller_actuation_screen_config(
+    *,
+    variant: str,
+    scale: float,
+    update_rate: float,
+) -> Trainer.Config:
+    """Build a named Stage-1 controller actuation screen config."""
+    cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm()
+    checkpoint_folder = (
+        "checkpoint_nanovlm_230m_momh_soft_gating_b5_tttv_nopack_"
+        f"balance_controller_wsm_screen_{variant}"
+    )
+    return _with_controller_actuation_screen(
+        cfg,
+        scale=scale,
+        checkpoint_folder=checkpoint_folder,
+        momh_balance_update_rate=update_rate,
+    )
+
+
+def _soft_gating_actuation_screen_config(
+    cfg: Trainer.Config,
+    *,
+    variant: str,
+    scale: float = 1.0,
+    **model_overrides,
+) -> Trainer.Config:
+    """Build a named Stage-1 soft-gating actuation screen config."""
+    checkpoint_folder = (
+        "checkpoint_nanovlm_230m_momh_soft_gating_b5_tttv_nopack_"
+        f"screen_{variant}"
+    )
+    return _with_controller_actuation_screen(
+        cfg,
+        scale=scale,
+        checkpoint_folder=checkpoint_folder,
+        **model_overrides,
+    )
+
+
 def _resolve_hf_repo(repo_id: str) -> str:
     """Resolve an HF repo ID to a local cache directory."""
     return snapshot_download(repo_id)
@@ -572,6 +664,114 @@ def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm() -> Tra
         cfg,
         checkpoint_folder="checkpoint_nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm",
         checkpoint_interval=250,
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_layer_mean_wsm() -> Trainer.Config:
+    """Soft-gating controller recipe that preserves head specialization."""
+    cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm()
+    return _with_model_overrides(
+        cfg,
+        momh_balance_signal="layer_mean_gate_prob",
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm_screen_c1() -> Trainer.Config:
+    """Stage-1 controller actuation screen reference (`scale=1`, `u=1e-3`)."""
+    return _controller_actuation_screen_config(
+        variant="c1",
+        scale=1.0,
+        update_rate=0.001,
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm_screen_c2() -> Trainer.Config:
+    """Stage-1 controller actuation screen (`scale=2`, `u=1e-3`)."""
+    return _controller_actuation_screen_config(
+        variant="c2",
+        scale=2.0,
+        update_rate=0.001,
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm_screen_c3() -> Trainer.Config:
+    """Stage-1 controller actuation screen (`scale=4`, `u=1e-3`)."""
+    return _controller_actuation_screen_config(
+        variant="c3",
+        scale=4.0,
+        update_rate=0.001,
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm_screen_c4() -> Trainer.Config:
+    """Stage-1 controller actuation screen (`scale=2`, `u=2e-3`)."""
+    return _controller_actuation_screen_config(
+        variant="c4",
+        scale=2.0,
+        update_rate=0.002,
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm() -> Trainer.Config:
+    """Stage-1 screen: split `tt`/`tv` warm init without controller."""
+    cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm()
+    return _soft_gating_actuation_screen_config(
+        cfg,
+        variant="split_warm",
+        momh_gate_metrics_enabled=True,
+        momh_gate_metrics_mode="local",
+        momh_soft_gating_init="tt_tv_split_warm",
+        momh_soft_gating_init_strength=2.0,
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_layer_mean_wsm_screen_split_warm() -> Trainer.Config:
+    """Stage-1 screen: split warm init plus layer-mean controller."""
+    cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_layer_mean_wsm()
+    return _soft_gating_actuation_screen_config(
+        cfg,
+        variant="split_warm_layer_mean",
+        momh_soft_gating_init="tt_tv_split_warm",
+        momh_soft_gating_init_strength=2.0,
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_tvwarm() -> Trainer.Config:
+    """Stage-1 screen: all text-query heads start biased toward `tv`."""
+    cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm()
+    return _soft_gating_actuation_screen_config(
+        cfg,
+        variant="tvwarm",
+        momh_gate_metrics_enabled=True,
+        momh_gate_metrics_mode="local",
+        momh_soft_gating_init="tt_tv_tvwarm",
+        momh_soft_gating_init_strength=2.0,
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm_frozen_gate() -> Trainer.Config:
+    """Stage-1 screen: split warm init with gate frozen out of LM gradients."""
+    cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm()
+    cfg = _with_frozen_momh_gate(cfg)
+    return _soft_gating_actuation_screen_config(
+        cfg,
+        variant="split_warm_frozen_gate",
+        momh_gate_metrics_enabled=True,
+        momh_gate_metrics_mode="local",
+        momh_soft_gating_init="tt_tv_split_warm",
+        momh_soft_gating_init_strength=2.0,
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_layer_mean_wsm_screen_split_warm_frozen_gate() -> Trainer.Config:
+    """Stage-1 screen: split warm init, frozen gate, layer-mean controller."""
+    cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_layer_mean_wsm()
+    cfg = _with_frozen_momh_gate(cfg)
+    return _soft_gating_actuation_screen_config(
+        cfg,
+        variant="split_warm_layer_mean_frozen_gate",
+        momh_soft_gating_init="tt_tv_split_warm",
+        momh_soft_gating_init_strength=2.0,
     )
 
 

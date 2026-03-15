@@ -62,6 +62,12 @@ Reference run family:
 | aux abs `tv_error_mean` max | `0.00461` | Still modest |
 | aux `tt_tv_abs_mean` avg | `0.0128` | Direct gate-effect metric across layers |
 | aux `tt_tv_abs_max` overall | `0.0573` | Strongest observed per-head bias gap |
+| `C1` avg `tt_tv_abs_mean` | `0.001040` | `scale=1`, `u=1e-3`, `100` steps |
+| `C2` avg `tt_tv_abs_mean` | `0.002017` | `scale=2`, `u=1e-3`, `100` steps |
+| `C3` avg `tt_tv_abs_mean` | `0.004183` | `scale=4`, `u=1e-3`, best stage-1 screen |
+| `C4` avg `tt_tv_abs_mean` | `0.003876` | `scale=2`, `u=2e-3`, `100` steps |
+| `C3` confirm300 avg `tt_tv_abs_mean` | `0.004078` | Stable at `300` steps, still below promotion bar |
+| promotion bar | `0.02` | Minimum average layerwise actuation required before another `3000`-step run |
 
 ## Recommended Practice
 
@@ -85,6 +91,10 @@ Before another `3000`-step balance run, run `100-300` step screens for:
 - stronger warm init if that path is available
 
 Promote only variants that show clearly larger gate-effect metrics without early-step instability.
+In the current family, a practical promotion rule is:
+- require average layerwise `momh_gate_effect/*/tt_tv_abs_mean >= 0.02`
+- stop the sweep if scale-only controller variants top out around `0.004-0.005`
+- move to a different actuation mechanism instead of spending another `3000`-step budget
 
 ### Step 3: Use direct actuation metrics, not only balance proxies
 
@@ -97,6 +107,11 @@ At minimum, inspect:
 Treat near-zero `tv_error_mean` as evidence that the controller is not steering
 the gate strongly enough, even if training remains stable.
 
+The current evidence says:
+- increasing `momh_soft_gating_scale` does increase the proxy effect size
+- but scale alone was not enough to clear the promotion threshold
+- so the next design cycle should prioritize stronger warm init or a different control target, not more small scale/update-rate sweeps
+
 ### Step 4: Choose winners by merged-checkpoint downstream eval
 
 Do not promote a balance variant on final-step training loss alone.
@@ -108,6 +123,7 @@ Keep WSM selection and full downstream eval as the decision gate.
 |-------------|-----|--------|
 | Controller balance run | Gate stayed too close to `0.5/0.5` | A stable controller can still be too weak to matter |
 | Aux-loss balance run | Gate moved modestly but downstream `mmstar` got worse | More movement alone is not enough |
+| Scale-only controller sweep | `momh_soft_gating_scale` improved proxy metrics but topped out at `0.004078` average `tt_tv_abs_mean` after `300` steps | Stronger gain alone does not justify another long run |
 | Judging from balance proxy only | `tt/tv` gate probability does not guarantee meaningful realized attention change | Log direct bias-gap metrics and, if possible, realized-effect metrics |
 | Spending long-run budget before actuation screening | Weak variants can consume full `3000`-step runs without any downstream gain | Require `100-300` step promotion screens first |
 
@@ -127,7 +143,7 @@ soft_gating_actuation_screen:
     gate_scale: [1, 2, 4]
     controller_update_rate: [0.001, 0.002, 0.004]
   promote_if:
-    gate_effect_increases: true
+    average_tt_tv_abs_mean_gte: 0.02
     no_early_step_instability: true
     downstream_eval_on_merged_checkpoint: true
 ```
@@ -139,3 +155,8 @@ soft_gating_actuation_screen:
 - `eval_results/torchtitan/wsm-s2-aux-mmstar-full-20260315-v1/per_task.json`
 - `outputs/wsm_softgating_3000_20260314_wandb/s1_controller/tb/20260314-2334/wandb/run-20260314_233404-4f7iu2qc/files/wandb-summary.json`
 - `outputs/wsm_softgating_3000_20260314_wandb/s2_aux/tb/20260315-1122/wandb/run-20260315_112232-vfp59yr1/files/wandb-summary.json`
+- `outputs/soft_gating_actuation_20260315/c1/tb/20260315-1729/wandb/run-20260315_172908-8zy5vdmm/files/wandb-summary.json`
+- `outputs/soft_gating_actuation_20260315/c2/tb/20260315-1733/wandb/run-20260315_173334-us9da8tb/files/wandb-summary.json`
+- `outputs/soft_gating_actuation_20260315/c3/tb/20260315-1738/wandb/run-20260315_173806-v8iyz3c5/files/wandb-summary.json`
+- `outputs/soft_gating_actuation_20260315/c4/tb/20260315-1742/wandb/run-20260315_174234-mj7k0u83/files/wandb-summary.json`
+- `outputs/soft_gating_actuation_20260315/c3_confirm300/tb/20260315-1754/wandb/run-20260315_175455-iswp6247/files/wandb-summary.json`

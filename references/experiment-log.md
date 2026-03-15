@@ -17,6 +17,131 @@ Each entry should include:
 ## 2026-03-15
 
 - **Date**: 2026-03-15
+- **Type**: Observation
+- **General description**: Ran a second soft-gating actuation cycle with `tt_tv`-specific warm starts, a layer-mean controller, and frozen-gate screens; the unfrozen variants still collapsed back to tiny actuation, while the frozen-gate variants improved throughput sharply but produced uninterpretable zero gate-effect summaries under FSDP.
+- **Details**:
+  - New implementation surfaces:
+    - `momh_soft_gating_init in {"tt_tv_split_warm", "tt_tv_tvwarm"}`
+    - `momh_soft_gating_init_strength`
+    - `momh_balance_signal="layer_mean_gate_prob"`
+    - signed diagnostics:
+      - `momh_gate_effect/layer_*/tt_tv_signed_mean`
+      - `momh_gate_effect/layer_*/tt_tv_signed_std`
+  - Sanity check:
+    - local model construction confirmed the split warm init was applied at build time, e.g. the first layer started with rows like `[2, -2, 0, 0]` and `[-2, 2, 0, 0]`
+    - this means the new init path itself is not broken
+  - Unfrozen `100`-step screens (`2x A100 40GB`, `FSDP`, `activation-checkpoint.mode=full`, `global_batch_size=64`, `local_batch_size=32`):
+    - `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm`
+      - W&B: `https://wandb.ai/erlandpg/torchtitan/runs/ockxtin6`
+      - average `tt_tv_abs_mean`: `0.002239`
+      - average signed-std: `0.002050`
+      - throughput: `35698.19`
+    - `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_layer_mean_wsm_screen_split_warm`
+      - W&B: `https://wandb.ai/erlandpg/torchtitan/runs/h28sufvo`
+      - average `tt_tv_abs_mean`: `0.002226`
+      - average signed-std: `0.002064`
+      - throughput: `35693.08`
+    - `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_tvwarm`
+      - W&B: `https://wandb.ai/erlandpg/torchtitan/runs/etcnp2y6`
+      - average `tt_tv_abs_mean`: `0.002239`
+      - average signed-std: `0.002047`
+      - throughput: `35602.61`
+  - Interpretation of unfrozen screens:
+    - all three variants converged back to the same tiny actuation band despite very different starts
+    - the warm starts were therefore being washed out by the normal LM-gradient path within `100` steps
+    - the layer-mean controller did not rescue the warm-start signal while the gate remained in the optimizer
+  - Frozen-gate screens:
+    - `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm_frozen_gate`
+      - W&B: `https://wandb.ai/erlandpg/torchtitan/runs/f0xo41m1`
+      - optimizer log showed `Frozen group 'momh_gate': 30 params (lr=0 → requires_grad=False)`
+      - throughput jumped to `72820.78`
+      - all logged gate-effect summaries were `0.0`
+    - `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_layer_mean_wsm_screen_split_warm_frozen_gate`
+      - W&B: `https://wandb.ai/erlandpg/torchtitan/runs/29nvitsc`
+      - same frozen-gate optimizer posture
+      - throughput jumped further to `75595.22`
+      - all logged gate-effect summaries were `0.0`
+  - Interpretation of frozen-gate screens:
+    - freezing `momh_gate` removes a measurable amount of training work and nearly doubles throughput in this `100`-step screen
+    - however, under the current FSDP metric path the frozen-gate runs produced zero gate-effect summaries, so they are not safe to promote as actuation wins yet
+    - this is an instrumentation or distributed-state ambiguity, not evidence that the strategy works
+  - Decision:
+    - do not promote any of these runs to `300` or `3000` steps yet
+    - the next blocking issue is to explain why frozen-gate FSDP runs log zero `momh_gate_effect/*` despite the warm-init path being correct at model construction time
+    - the strongest current research conclusion is that keeping the gate inside the LM optimizer causes rapid collapse toward neutral gating
+
+- **Date**: 2026-03-15
+- **Type**: Observation
+- **General description**: Ran the planned controller-first soft-gating actuation screen and confirmed that higher `momh_soft_gating_scale` strengthens the logged gate effect, but the best screened variant still failed the promotion bar for another `3000`-step run.
+- **Details**:
+  - Stage-1 `100`-step controller screens used:
+    - hardware: `2x A100 40GB`
+    - distributed family: `FSDP`
+    - activation checkpointing: `full`
+    - `global_batch_size=64`
+    - `local_batch_size=32`
+    - checkpointing disabled
+    - sparse local gate metrics with `momh_gate_metrics_interval=10`
+  - Screen configs:
+    - `C1`: `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm_screen_c1`
+      - `momh_soft_gating_scale=1.0`
+      - `momh_balance_update_rate=0.001`
+      - W&B: `https://wandb.ai/erlandpg/torchtitan/runs/8zy5vdmm`
+    - `C2`: `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm_screen_c2`
+      - `momh_soft_gating_scale=2.0`
+      - `momh_balance_update_rate=0.001`
+      - W&B: `https://wandb.ai/erlandpg/torchtitan/runs/us9da8tb`
+    - `C3`: `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm_screen_c3`
+      - `momh_soft_gating_scale=4.0`
+      - `momh_balance_update_rate=0.001`
+      - W&B: `https://wandb.ai/erlandpg/torchtitan/runs/v8iyz3c5`
+    - `C4`: `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm_screen_c4`
+      - `momh_soft_gating_scale=2.0`
+      - `momh_balance_update_rate=0.002`
+      - W&B: `https://wandb.ai/erlandpg/torchtitan/runs/mj7k0u83`
+  - Stage-1 ranking from local W&B summaries:
+    - `C1`:
+      - average `momh_gate_effect/*/tt_tv_abs_mean`: `0.001040`
+      - max layer `tt_tv_abs_mean`: `0.001643`
+      - max `tt_tv_abs_max`: `0.001993`
+      - throughput: `35610.90`
+    - `C2`:
+      - average `tt_tv_abs_mean`: `0.002017`
+      - max layer `tt_tv_abs_mean`: `0.003189`
+      - max `tt_tv_abs_max`: `0.003948`
+      - throughput: `35180.16`
+    - `C3`:
+      - average `tt_tv_abs_mean`: `0.004183`
+      - max layer `tt_tv_abs_mean`: `0.006298`
+      - max `tt_tv_abs_max`: `0.007893`
+      - throughput: `35465.32`
+    - `C4`:
+      - average `tt_tv_abs_mean`: `0.003876`
+      - max layer `tt_tv_abs_mean`: `0.005462`
+      - max `tt_tv_abs_max`: `0.007975`
+      - throughput: `35172.43`
+  - Stage-1 outcome:
+    - `C3` was the clear winner because it had the strongest average actuation with no meaningful throughput regression versus `C1`.
+    - `C4` increased peak head-level separation, but its average effect and `tv_error_mean` were both worse than `C3`.
+  - Stage-2 confirmation:
+    - promoted `C3` to a `300`-step confirmation run with:
+      - same distributed and batch contract
+      - dump folder: `outputs/soft_gating_actuation_20260315/c3_confirm300`
+      - W&B: `https://wandb.ai/erlandpg/torchtitan/runs/iswp6247`
+    - final confirmation metrics:
+      - average `momh_gate_effect/*/tt_tv_abs_mean`: `0.004078`
+      - max layer `tt_tv_abs_mean`: `0.006334`
+      - max `tt_tv_abs_max`: `0.007947`
+      - average absolute `tv_error_mean`: `0.000097`
+      - throughput: `34392.56`
+      - final `loss_metrics/global_avg_loss`: `3.4375`
+      - peak reserved memory: `17.65039 GiB`
+  - Decision:
+    - stop the controller scale-only screen here and do not promote a new `3000`-step run.
+    - the planned promotion bar was `average tt_tv_abs_mean >= 0.02`; the confirmed winner only reached `0.004078`.
+    - next design cycle should change actuation mechanism, not just scale the current controller. The most likely next levers are stronger warm initialization or a different gate-control target.
+
+- **Date**: 2026-03-15
 - **Type**: Retrospective
 - **General description**: Compared three `3000`-step no-pack soft-gating WSM runs and found that the new balance variants trained stably but did not beat the plain soft-gating control on full `mmstar`, while the logged gate signals remained too weak to show strong actuation.
 - **Details**:

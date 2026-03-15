@@ -107,6 +107,45 @@ def test_nanovlm_soft_gating_scale_must_be_positive():
         cfg.update_from_config(trainer_config=SimpleNamespace(dataloader=None))
 
 
+def test_tt_tv_specific_warm_init_requires_tt_tv_pairs():
+    cfg = NanoVLMModel.Config(
+        lm_hidden_dim=16,
+        lm_inter_dim=32,
+        lm_n_heads=4,
+        lm_n_kv_heads=2,
+        lm_n_blocks=1,
+        lm_vocab_size=32,
+        momh_enabled=True,
+        momh_soft_gating=True,
+        momh_soft_gating_pairs="all",
+        momh_soft_gating_init="tt_tv_split_warm",
+    )
+
+    with pytest.raises(ValueError, match="tt_tv-specific warm init requires"):
+        cfg.update_from_config(trainer_config=SimpleNamespace(dataloader=None))
+
+
+def test_nanovlm_soft_gating_init_strength_must_be_positive():
+    cfg = NanoVLMModel.Config(
+        lm_hidden_dim=16,
+        lm_inter_dim=32,
+        lm_n_heads=4,
+        lm_n_kv_heads=2,
+        lm_n_blocks=1,
+        lm_vocab_size=32,
+        momh_enabled=True,
+        momh_soft_gating=True,
+        momh_soft_gating_pairs="tt_tv",
+        momh_soft_gating_init="tt_tv_split_warm",
+        momh_soft_gating_init_strength=0.0,
+    )
+
+    with pytest.raises(
+        ValueError, match="momh_soft_gating_init_strength must be > 0"
+    ):
+        cfg.update_from_config(trainer_config=SimpleNamespace(dataloader=None))
+
+
 def test_compute_momh_balance_aux_loss_returns_none_when_disabled():
     attn = NanoVLMGQAttention(
         SimpleNamespace(
@@ -154,6 +193,48 @@ def test_compute_momh_balance_aux_loss_tracks_gate_proxy():
     balance_loss = attn.compute_momh_balance_aux_loss()
     assert balance_loss is not None
     assert balance_loss.item() > 0.0
+
+
+def test_tt_tv_split_warm_initializes_opposing_head_groups():
+    attn = NanoVLMGQAttention(
+        SimpleNamespace(
+            lm_n_heads=4,
+            lm_n_kv_heads=2,
+            lm_hidden_dim=16,
+            lm_dropout=0.0,
+            momh_enabled=True,
+            momh_soft_gating=True,
+            momh_soft_gating_pairs="tt_tv",
+            momh_soft_gating_init="tt_tv_split_warm",
+            momh_soft_gating_init_strength=2.0,
+        )
+    )
+
+    gate = attn.momh_gate.detach()
+    assert torch.equal(gate[:2, 0], torch.full((2,), 2.0))
+    assert torch.equal(gate[:2, 1], torch.full((2,), -2.0))
+    assert torch.equal(gate[2:, 0], torch.full((2,), -2.0))
+    assert torch.equal(gate[2:, 1], torch.full((2,), 2.0))
+
+
+def test_tt_tv_tvwarm_initializes_all_heads_toward_tv():
+    attn = NanoVLMGQAttention(
+        SimpleNamespace(
+            lm_n_heads=4,
+            lm_n_kv_heads=2,
+            lm_hidden_dim=16,
+            lm_dropout=0.0,
+            momh_enabled=True,
+            momh_soft_gating=True,
+            momh_soft_gating_pairs="tt_tv",
+            momh_soft_gating_init="tt_tv_tvwarm",
+            momh_soft_gating_init_strength=1.5,
+        )
+    )
+
+    gate = attn.momh_gate.detach()
+    assert torch.equal(gate[:, 0], torch.full((4,), -1.5))
+    assert torch.equal(gate[:, 1], torch.full((4,), 1.5))
 
 
 def test_generate_soft_gating_score_mod_applies_gate_scale():
@@ -232,6 +313,7 @@ class _HookDummyAttn(nn.Module):
         self.momh_balance_mode = "controller"
         self.momh_balance_target_tv = 0.5
         self.momh_balance_update_rate = 0.1
+        self.momh_balance_signal = "gate_prob"
         self.momh_soft_gating_scale = 1.0
 
 
@@ -279,4 +361,35 @@ def test_controller_hook_updates_tt_tv_and_emits_balance_metrics():
     assert "momh_balance/layer_0/tv_prob_mean" in metrics
     assert "momh_gate_effect/layer_0/tt_tv_abs_mean" in metrics
     assert "momh_gate_effect/layer_0/tt_tv_abs_max" in metrics
+    assert "momh_gate_effect/layer_0/tt_tv_signed_mean" in metrics
+    assert "momh_gate_effect/layer_0/tt_tv_signed_std" in metrics
     assert metrics["momh_gate_effect/layer_0/scale"] == pytest.approx(1.0)
+
+
+def test_layer_mean_controller_applies_uniform_tt_tv_shift():
+    optimizers = _DummyOptimizers()
+    model = _HookDummyModel()
+    model.layers["0"].attn.momh_gate.data.copy_(
+        torch.tensor(
+            [[2.0, -2.0, 0.0, 0.0], [-1.0, 1.0, 0.0, 0.0]],
+            dtype=torch.float32,
+        )
+    )
+    model.layers["0"].attn.momh_balance_signal = "layer_mean_gate_prob"
+    nanovlm_post_optimizer_build_fn(
+        optimizers,
+        [model],
+        parallel_dims=SimpleNamespace(),
+    )
+
+    assert optimizers.hook is not None
+    before = model.layers["0"].attn.momh_gate.detach().clone()
+    optimizers.hook()
+    after = model.layers["0"].attn.momh_gate.detach().clone()
+
+    tt_update = after[:, 0] - before[:, 0]
+    tv_update = after[:, 1] - before[:, 1]
+    assert torch.allclose(tt_update, tt_update[0].expand_as(tt_update))
+    assert torch.allclose(tv_update, tv_update[0].expand_as(tv_update))
+    assert tt_update[0].item() < 0.0
+    assert tv_update[0].item() > 0.0

@@ -25,6 +25,13 @@ from .attention import (
     generate_soft_gating_score_mod,
 )
 
+_SOFT_GATING_INIT_MODES = {
+    "zero",
+    "warm",
+    "tt_tv_split_warm",
+    "tt_tv_tvwarm",
+}
+
 
 # ---------------------------------------------------------------------------
 # Helper: build block mask outside compiled regions
@@ -372,23 +379,14 @@ class NanoVLMGQAttention(nn.Module):
         self.momh_balance_update_rate = float(
             getattr(cfg, "momh_balance_update_rate", 0.0)
         )
+        self.momh_soft_gating_init = str(getattr(cfg, "momh_soft_gating_init", "zero"))
+        self.momh_soft_gating_init_strength = float(
+            getattr(cfg, "momh_soft_gating_init_strength", 2.0)
+        )
         self.momh_soft_gating = getattr(cfg, "momh_soft_gating", False)
         if self.momh_soft_gating:
             self.momh_gate = nn.Parameter(torch.zeros(self.n_heads, 4))
-            if getattr(cfg, "momh_soft_gating_init", "zero") == "warm":
-                with torch.no_grad():
-                    NEG = -10.0
-                    for h in range(self.momh_n_v_heads):
-                        self.momh_gate.data[h] = torch.tensor(
-                            [NEG, NEG, NEG, 0.0]
-                        )
-                    for h in range(
-                        self.momh_n_v_heads,
-                        self.momh_n_v_heads + self.momh_n_t_heads,
-                    ):
-                        self.momh_gate.data[h] = torch.tensor(
-                            [0.0, NEG, NEG, NEG]
-                        )
+            self._initialize_momh_gate()
 
         assert self.n_heads % self.n_kv_heads == 0
         assert self.embd_dim % self.n_heads == 0
@@ -406,6 +404,49 @@ class NanoVLMGQAttention(nn.Module):
         self.out_proj = nn.Linear(self.embd_dim, self.embd_dim, bias=False)
         self.attn_dropout = nn.Dropout(self.dropout)
         self.resid_dropout = nn.Dropout(self.dropout)
+
+    def _initialize_momh_gate(self) -> None:
+        if self.momh_soft_gating_init == "zero":
+            return
+
+        with torch.no_grad():
+            if self.momh_soft_gating_init == "warm":
+                neg = -10.0
+                for h in range(self.momh_n_v_heads):
+                    self.momh_gate.data[h] = torch.tensor(
+                        [neg, neg, neg, 0.0],
+                        device=self.momh_gate.device,
+                        dtype=self.momh_gate.dtype,
+                    )
+                for h in range(
+                    self.momh_n_v_heads,
+                    self.momh_n_v_heads + self.momh_n_t_heads,
+                ):
+                    self.momh_gate.data[h] = torch.tensor(
+                        [0.0, neg, neg, neg],
+                        device=self.momh_gate.device,
+                        dtype=self.momh_gate.dtype,
+                    )
+                return
+
+            delta = float(self.momh_soft_gating_init_strength)
+            if self.momh_soft_gating_init == "tt_tv_split_warm":
+                split_point = self.n_heads // 2
+                self.momh_gate.data[:split_point, 0] = delta
+                self.momh_gate.data[:split_point, 1] = -delta
+                self.momh_gate.data[split_point:, 0] = -delta
+                self.momh_gate.data[split_point:, 1] = delta
+                return
+
+            if self.momh_soft_gating_init == "tt_tv_tvwarm":
+                self.momh_gate.data[:, 0] = -delta
+                self.momh_gate.data[:, 1] = delta
+                return
+
+            raise ValueError(
+                "momh_soft_gating_init must be one of "
+                f"{sorted(_SOFT_GATING_INIT_MODES)}, got {self.momh_soft_gating_init!r}"
+            )
 
     def compute_momh_balance_aux_loss(self) -> torch.Tensor | None:
         if self.momh_balance_mode != "aux_loss" or not self.momh_soft_gating:
@@ -663,9 +704,15 @@ class NanoVLMModel(BaseModel):
         momh_kv_groups_vision: int | None = None
         momh_kv_groups_text: int | None = None
         momh_soft_gating: bool = False
-        momh_soft_gating_init: str = "zero"
+        momh_soft_gating_init: Literal[
+            "zero",
+            "warm",
+            "tt_tv_split_warm",
+            "tt_tv_tvwarm",
+        ] = "zero"
         momh_soft_gating_pairs: str = "all"
         momh_soft_gating_scale: float = 1.0
+        momh_soft_gating_init_strength: float = 2.0
         momh_structural_mask_only: bool = False
         momh_causal_gating: bool = False
         # Optional soft-gating diagnostics. Keep disabled by default to avoid
@@ -678,7 +725,7 @@ class NanoVLMModel(BaseModel):
         momh_gate_metrics_interval: int = 50
         # Optional soft-gating balance control for the existing `tt_tv` path.
         momh_balance_mode: Literal["off", "aux_loss", "controller"] = "off"
-        momh_balance_signal: Literal["gate_prob"] = "gate_prob"
+        momh_balance_signal: Literal["gate_prob", "layer_mean_gate_prob"] = "gate_prob"
         momh_balance_target_tv: float = 0.5
         momh_balance_aux_weight: float = 0.0
         momh_balance_update_rate: float = 0.0
@@ -698,6 +745,12 @@ class NanoVLMModel(BaseModel):
                     "momh_gate_metrics_mode must be one of {'local', 'global'}, "
                     f"got {self.momh_gate_metrics_mode!r}"
                 )
+            if self.momh_soft_gating_init not in _SOFT_GATING_INIT_MODES:
+                raise ValueError(
+                    "momh_soft_gating_init must be one of "
+                    f"{sorted(_SOFT_GATING_INIT_MODES)}, "
+                    f"got {self.momh_soft_gating_init!r}"
+                )
             if self.momh_gate_metrics_interval <= 0:
                 raise ValueError(
                     "momh_gate_metrics_interval must be > 0, "
@@ -708,15 +761,29 @@ class NanoVLMModel(BaseModel):
                     "momh_soft_gating_scale must be > 0, "
                     f"got {self.momh_soft_gating_scale}"
                 )
+            if self.momh_soft_gating_init_strength <= 0.0:
+                raise ValueError(
+                    "momh_soft_gating_init_strength must be > 0, "
+                    f"got {self.momh_soft_gating_init_strength}"
+                )
             if self.momh_balance_mode not in {"off", "aux_loss", "controller"}:
                 raise ValueError(
                     "momh_balance_mode must be one of {'off', 'aux_loss', 'controller'}, "
                     f"got {self.momh_balance_mode!r}"
                 )
-            if self.momh_balance_signal != "gate_prob":
+            if self.momh_balance_signal not in {"gate_prob", "layer_mean_gate_prob"}:
                 raise ValueError(
-                    "momh_balance_signal must be 'gate_prob', "
+                    "momh_balance_signal must be one of "
+                    "{'gate_prob', 'layer_mean_gate_prob'}, "
                     f"got {self.momh_balance_signal!r}"
+                )
+            if (
+                self.momh_soft_gating_init in {"tt_tv_split_warm", "tt_tv_tvwarm"}
+                and self.momh_soft_gating_pairs != "tt_tv"
+            ):
+                raise ValueError(
+                    "tt_tv-specific warm init requires "
+                    "momh_soft_gating_pairs='tt_tv'"
                 )
             if not 0.0 <= self.momh_balance_target_tv <= 1.0:
                 raise ValueError(

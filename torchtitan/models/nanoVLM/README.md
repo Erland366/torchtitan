@@ -195,6 +195,16 @@ variants:
 - `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_aux_wsm`
 - `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller`
 - `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_layer_mean_wsm`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm_screen_c1`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm_screen_c2`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm_screen_c3`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm_screen_c4`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_layer_mean_wsm_screen_split_warm`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_tvwarm`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm_frozen_gate`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_layer_mean_wsm_screen_split_warm_frozen_gate`
 
 Operational guidance:
 - keep gate metrics disabled for throughput-focused FSDP runs
@@ -202,17 +212,28 @@ Operational guidance:
 - use global mode only when exact all-rank gate means are required
 - the `_wsm` balance variants keep sparse local gate metrics and a checkpoint
   interval tuned for offline merge-window comparisons
+- the `_screen_c*` controller variants are `100`-step actuation screens for
+  `2x A100` FSDP runs with `activation-checkpoint.mode=full`, `global_batch_size=64`,
+  `local_batch_size=32`, checkpointing disabled, and `momh_gate_metrics_interval=10`
+- the `split_warm*` screen variants are the next-cycle actuation experiments:
+  they test `tt_tv`-specific warm-starts, optional layer-mean controller updates,
+  and an optional frozen-gate mode that removes the gate from LM-gradient updates
 
 ### Optional soft-gating balance controls
 
 The `tt_tv` soft-gating path now has opt-in balance controls that operate on the
 learnable gate proxy instead of instrumenting realized attention mass:
 
+- `momh_soft_gating_init`: `"zero"`, `"warm"`, `"tt_tv_split_warm"`, or `"tt_tv_tvwarm"`
+- `momh_soft_gating_init_strength`: magnitude used by the `tt_tv`-specific warm
+  starts (`±strength` on the `tt`/`tv` columns)
 - `momh_soft_gating_scale`: multiplies the gate bias before it perturbs the
   attention score, so the same learned/controller gate can have a stronger or
   weaker effect on the realized attention logits
 - `momh_balance_mode`: `"off"`, `"aux_loss"`, or `"controller"`
-- `momh_balance_signal`: currently only `"gate_prob"`
+- `momh_balance_signal`: `"gate_prob"` for per-head updates or
+  `"layer_mean_gate_prob"` for one shared layer-level shift that preserves
+  head-to-head specialization
 - `momh_balance_target_tv`: target `tv` probability for the active `tt`/`tv` pair
 - `momh_balance_aux_weight`: auxiliary-loss weight when mode is `"aux_loss"`
 - `momh_balance_update_rate`: non-gradient post-step update size when mode is `"controller"`
@@ -221,6 +242,7 @@ Current limitations:
 - balance mode requires `momh_soft_gating=True`
 - balance mode requires `momh_soft_gating_pairs="tt_tv"`
 - balance mode is not supported with pipeline parallelism
+- the `tt_tv`-specific warm starts require `momh_soft_gating_pairs="tt_tv"`
 - v1 balances the gate proxy only; it does not recover runtime attention-pair usage
 - `momh_soft_gating_scale` changes how strongly the gate affects attention, but
   the balance controller still reads the raw `tt`/`tv` gate proxy, so controller
@@ -237,6 +259,8 @@ Logged diagnostics include:
 - `momh_balance/layer_*/aux_loss_mean`
 - `momh_gate_effect/layer_*/tt_tv_abs_mean`
 - `momh_gate_effect/layer_*/tt_tv_abs_max`
+- `momh_gate_effect/layer_*/tt_tv_signed_mean`
+- `momh_gate_effect/layer_*/tt_tv_signed_std`
 - `momh_gate_effect/layer_*/scale`
 
 ## 100-Step A/B Parity Benchmark
