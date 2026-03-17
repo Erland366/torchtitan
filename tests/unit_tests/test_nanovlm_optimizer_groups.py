@@ -35,7 +35,11 @@ class _DummyModel(nn.Module):
         self.decoder = _DummyDecoder()
 
 
-def _build_groups(lr_momh_gate: float | None):
+def _build_groups(
+    lr_momh_gate: float | None,
+    *,
+    momh_gate_freeze_steps: int = 0,
+):
     model = _DummyModel()
     config = NanoVLMOptimizersContainer.Config(
         name="AdamW",
@@ -43,6 +47,7 @@ def _build_groups(lr_momh_gate: float | None):
         lr_vision=0.0,
         lr_projector=1e-5,
         lr_momh_gate=lr_momh_gate,
+        momh_gate_freeze_steps=momh_gate_freeze_steps,
         beta1=0.9,
         beta2=0.999,
         eps=1e-8,
@@ -76,3 +81,12 @@ def test_gate_params_split_when_lr_momh_gate_is_explicit():
     assert id(gate_param) in gate_param_ids
     assert id(gate_param) not in lm_param_ids
     assert group_map["momh_gate"]["lr"] == 0.01
+
+
+def test_gate_group_can_carry_freeze_thaw_metadata():
+    _, groups = _build_groups(lr_momh_gate=0.01, momh_gate_freeze_steps=50)
+    group_map = {group["name"]: group for group in groups}
+
+    assert group_map["momh_gate"]["lr"] == 0.01
+    assert group_map["momh_gate"]["max_lr"] == 0.01
+    assert group_map["momh_gate"]["freeze_steps"] == 50

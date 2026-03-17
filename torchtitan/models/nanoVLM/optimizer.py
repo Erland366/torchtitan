@@ -32,6 +32,9 @@ class NanoVLMOptimizersContainer(OptimizersContainer):
         lr_momh_gate: float | None = None
         """Learning rate for MoMH gate parameters. None = use base lr."""
 
+        momh_gate_freeze_steps: int = 0
+        """Freeze `momh_gate` optimizer updates for the first N steps, then thaw."""
+
         implementation: Literal["for-loop", "foreach", "fused"] = "foreach"
         """Default to foreach for nanoVLM parity with nanoVLM_main AdamW behavior."""
 
@@ -62,6 +65,17 @@ def _build_param_groups(
     base_kwargs: dict,
 ) -> list[dict]:
     """Classify model parameters into optimizer groups with per-component LRs."""
+    if config.momh_gate_freeze_steps < 0:
+        raise ValueError(
+            "optimizer.momh_gate_freeze_steps must be >= 0, "
+            f"got {config.momh_gate_freeze_steps}"
+        )
+    if config.momh_gate_freeze_steps > 0 and config.lr_momh_gate is None:
+        raise ValueError(
+            "optimizer.momh_gate_freeze_steps requires optimizer.lr_momh_gate "
+            "to be set explicitly"
+        )
+
     vision_params = []
     projector_params = []
     gate_params = []
@@ -117,9 +131,17 @@ def _build_param_groups(
             "name": group_name,
             "max_lr": lr,
         }
+        if group_name == "momh_gate" and config.momh_gate_freeze_steps > 0:
+            group["freeze_steps"] = config.momh_gate_freeze_steps
         groups.append(group)
-        logger.info(
-            f"Optimizer group '{group_name}': {len(params)} params, lr={lr}"
-        )
+        if group_name == "momh_gate" and config.momh_gate_freeze_steps > 0:
+            logger.info(
+                f"Freeze-thaw group '{group_name}': {len(params)} params, "
+                f"lr={lr}, freeze_steps={config.momh_gate_freeze_steps}"
+            )
+        else:
+            logger.info(
+                f"Optimizer group '{group_name}': {len(params)} params, lr={lr}"
+            )
 
     return groups

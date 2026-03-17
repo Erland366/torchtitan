@@ -97,6 +97,29 @@ def _with_frozen_momh_gate(cfg: Trainer.Config) -> Trainer.Config:
     return cfg
 
 
+def _with_low_momh_gate_lr(
+    cfg: Trainer.Config,
+    *,
+    lr: float = 1e-5,
+) -> Trainer.Config:
+    """Apply a reduced learning rate for `momh_gate` without changing other groups."""
+    cfg.optimizer = dataclasses.replace(cfg.optimizer, lr_momh_gate=lr)
+    return cfg
+
+
+def _with_freeze_thaw_momh_gate(
+    cfg: Trainer.Config,
+    *,
+    freeze_steps: int,
+) -> Trainer.Config:
+    """Freeze `momh_gate` updates early, then thaw back to its configured LR."""
+    cfg.optimizer = dataclasses.replace(
+        cfg.optimizer,
+        momh_gate_freeze_steps=freeze_steps,
+    )
+    return cfg
+
+
 def _with_controller_actuation_screen(
     cfg: Trainer.Config,
     *,
@@ -176,6 +199,22 @@ def _soft_gating_actuation_screen_config(
         cfg,
         scale=scale,
         checkpoint_folder=checkpoint_folder,
+        **model_overrides,
+    )
+
+
+def _split_warm_screen_config(
+    cfg: Trainer.Config,
+    *,
+    variant: str,
+    **model_overrides,
+) -> Trainer.Config:
+    """Build a Stage-1 screen config with split `tt`/`tv` warm init."""
+    return _soft_gating_actuation_screen_config(
+        cfg,
+        variant=variant,
+        momh_soft_gating_init="tt_tv_split_warm",
+        momh_soft_gating_init_strength=2.0,
         **model_overrides,
     )
 
@@ -715,24 +754,206 @@ def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm_screen_c
 def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm() -> Trainer.Config:
     """Stage-1 screen: split `tt`/`tv` warm init without controller."""
     cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm()
-    return _soft_gating_actuation_screen_config(
+    return _split_warm_screen_config(
         cfg,
         variant="split_warm",
         momh_gate_metrics_enabled=True,
         momh_gate_metrics_mode="local",
-        momh_soft_gating_init="tt_tv_split_warm",
-        momh_soft_gating_init_strength=2.0,
     )
 
 
 def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_layer_mean_wsm_screen_split_warm() -> Trainer.Config:
     """Stage-1 screen: split warm init plus layer-mean controller."""
     cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_layer_mean_wsm()
-    return _soft_gating_actuation_screen_config(
+    return _split_warm_screen_config(
         cfg,
         variant="split_warm_layer_mean",
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm_low_gate_lr() -> Trainer.Config:
+    """Stage-1 retention screen: split warm init with reduced gate LR."""
+    cfg = _with_low_momh_gate_lr(
+        nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm()
+    )
+    return _split_warm_screen_config(
+        cfg,
+        variant="split_warm_low_gate_lr",
+        momh_gate_metrics_enabled=True,
+        momh_gate_metrics_mode="local",
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm_low_gate_lr_init1() -> Trainer.Config:
+    """Stage-1 retention screen: weaker split warm init (`strength=1.0`)."""
+    cfg = _with_low_momh_gate_lr(
+        nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm()
+    )
+    return _soft_gating_actuation_screen_config(
+        cfg,
+        variant="split_warm_low_gate_lr_init1",
+        momh_gate_metrics_enabled=True,
+        momh_gate_metrics_mode="local",
+        momh_soft_gating_init="tt_tv_split_warm",
+        momh_soft_gating_init_strength=1.0,
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm_low_gate_lr_init05() -> Trainer.Config:
+    """Stage-1 retention screen: weaker split warm init (`strength=0.5`)."""
+    cfg = _with_low_momh_gate_lr(
+        nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm()
+    )
+    return _soft_gating_actuation_screen_config(
+        cfg,
+        variant="split_warm_low_gate_lr_init05",
+        momh_gate_metrics_enabled=True,
+        momh_gate_metrics_mode="local",
+        momh_soft_gating_init="tt_tv_split_warm",
+        momh_soft_gating_init_strength=0.5,
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_confirm_split_warm_low_gate_lr_init1() -> Trainer.Config:
+    """Stage-2 confirmation: weaker split warm init (`strength=1.0`) with low gate LR."""
+    cfg = _with_low_momh_gate_lr(
+        nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm()
+    )
+    cfg.training = dataclasses.replace(
+        cfg.training,
+        steps=300,
+        local_batch_size=32,
+        global_batch_size=64,
+    )
+    cfg.metrics = dataclasses.replace(
+        cfg.metrics,
+        log_freq=25,
+        enable_wandb=True,
+    )
+    cfg.parallelism = dataclasses.replace(
+        cfg.parallelism,
+        data_parallel_replicate_degree=1,
+        data_parallel_shard_degree=2,
+    )
+    cfg.activation_checkpoint = dataclasses.replace(
+        cfg.activation_checkpoint,
+        mode="full",
+    )
+    cfg.checkpoint = dataclasses.replace(
+        cfg.checkpoint,
+        enable=True,
+        folder=(
+            "checkpoint_nanovlm_230m_momh_soft_gating_b5_tttv_nopack_"
+            "confirm_split_warm_low_gate_lr_init1"
+        ),
+        interval=100,
+    )
+    return _with_model_overrides(
+        cfg,
+        momh_gate_metrics_enabled=True,
+        momh_gate_metrics_mode="local",
+        momh_gate_metrics_interval=25,
+        momh_soft_gating_init="tt_tv_split_warm",
+        momh_soft_gating_init_strength=1.0,
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_split_warm_low_gate_lr_init1() -> Trainer.Config:
+    """Long-run WSM recipe: weaker split warm init (`strength=1.0`) with low gate LR."""
+    cfg = _with_low_momh_gate_lr(
+        nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm()
+    )
+    cfg.training = dataclasses.replace(cfg.training, steps=3000)
+    cfg.checkpoint = dataclasses.replace(
+        cfg.checkpoint,
+        folder=(
+            "checkpoint_nanovlm_230m_momh_soft_gating_b5_tttv_nopack_"
+            "wsm_split_warm_low_gate_lr_init1"
+        ),
+        interval=250,
+    )
+    return _with_model_overrides(
+        cfg,
+        momh_gate_metrics_enabled=True,
+        momh_gate_metrics_mode="local",
+        momh_gate_metrics_interval=50,
+        momh_soft_gating_init="tt_tv_split_warm",
+        momh_soft_gating_init_strength=1.0,
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm_freeze_thaw_low_gate_lr() -> Trainer.Config:
+    """Stage-1 retention screen: split warm init with early frozen gate, then thaw."""
+    cfg = _with_low_momh_gate_lr(
+        nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm()
+    )
+    cfg = _with_freeze_thaw_momh_gate(cfg, freeze_steps=50)
+    return _split_warm_screen_config(
+        cfg,
+        variant="split_warm_freeze_thaw_low_gate_lr",
+        momh_gate_metrics_enabled=True,
+        momh_gate_metrics_mode="local",
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_split_warm_freeze_thaw_low_gate_lr() -> Trainer.Config:
+    """Long-run WSM recipe: split warm init, early freeze-thaw, low gate LR."""
+    cfg = _with_low_momh_gate_lr(
+        nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm()
+    )
+    cfg = _with_freeze_thaw_momh_gate(cfg, freeze_steps=50)
+    cfg.training = dataclasses.replace(cfg.training, steps=3000)
+    cfg.checkpoint = dataclasses.replace(
+        cfg.checkpoint,
+        folder=(
+            "checkpoint_nanovlm_230m_momh_soft_gating_b5_tttv_nopack_"
+            "wsm_split_warm_freeze_thaw_low_gate_lr"
+        ),
+        interval=250,
+    )
+    return _with_model_overrides(
+        cfg,
+        momh_gate_metrics_enabled=True,
+        momh_gate_metrics_mode="local",
+        momh_gate_metrics_interval=50,
         momh_soft_gating_init="tt_tv_split_warm",
         momh_soft_gating_init_strength=2.0,
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_split_warm_frozen_gate() -> Trainer.Config:
+    """Long-run WSM recipe: split warm init with permanently frozen gate."""
+    cfg = _with_frozen_momh_gate(
+        nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm()
+    )
+    cfg.training = dataclasses.replace(cfg.training, steps=3000)
+    cfg.checkpoint = dataclasses.replace(
+        cfg.checkpoint,
+        folder=(
+            "checkpoint_nanovlm_230m_momh_soft_gating_b5_tttv_nopack_"
+            "wsm_split_warm_frozen_gate"
+        ),
+        interval=250,
+    )
+    return _with_model_overrides(
+        cfg,
+        momh_gate_metrics_enabled=True,
+        momh_gate_metrics_mode="local",
+        momh_gate_metrics_interval=50,
+        momh_soft_gating_init="tt_tv_split_warm",
+        momh_soft_gating_init_strength=2.0,
+    )
+
+
+def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_layer_mean_wsm_screen_split_warm_low_gate_lr() -> Trainer.Config:
+    """Stage-1 retention screen: split warm init, low gate LR, gentle layer-mean controller."""
+    cfg = _with_low_momh_gate_lr(
+        nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_layer_mean_wsm()
+    )
+    return _split_warm_screen_config(
+        cfg,
+        variant="split_warm_layer_mean_low_gate_lr",
+        momh_balance_update_rate=5e-4,
     )
 
 
@@ -753,13 +974,11 @@ def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm_frozen_ga
     """Stage-1 screen: split warm init with gate frozen out of LM gradients."""
     cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm()
     cfg = _with_frozen_momh_gate(cfg)
-    return _soft_gating_actuation_screen_config(
+    return _split_warm_screen_config(
         cfg,
         variant="split_warm_frozen_gate",
         momh_gate_metrics_enabled=True,
         momh_gate_metrics_mode="local",
-        momh_soft_gating_init="tt_tv_split_warm",
-        momh_soft_gating_init_strength=2.0,
     )
 
 
@@ -767,11 +986,9 @@ def nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_layer_mean_w
     """Stage-1 screen: split warm init, frozen gate, layer-mean controller."""
     cfg = nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_layer_mean_wsm()
     cfg = _with_frozen_momh_gate(cfg)
-    return _soft_gating_actuation_screen_config(
+    return _split_warm_screen_config(
         cfg,
         variant="split_warm_layer_mean_frozen_gate",
-        momh_soft_gating_init="tt_tv_split_warm",
-        momh_soft_gating_init_strength=2.0,
     )
 
 

@@ -410,43 +410,71 @@ class NanoVLMGQAttention(nn.Module):
             return
 
         with torch.no_grad():
+            gate_data, row_offset = self._get_local_momh_gate_data()
+            gate_data.zero_()
+
             if self.momh_soft_gating_init == "warm":
                 neg = -10.0
+                vision_row = gate_data.new_tensor([neg, neg, neg, 0.0])
+                text_row = gate_data.new_tensor([0.0, neg, neg, neg])
+
+                def assign_row(global_row: int, row_value: torch.Tensor) -> None:
+                    local_row = global_row - row_offset
+                    if 0 <= local_row < gate_data.shape[0]:
+                        gate_data[local_row] = row_value
+
                 for h in range(self.momh_n_v_heads):
-                    self.momh_gate.data[h] = torch.tensor(
-                        [neg, neg, neg, 0.0],
-                        device=self.momh_gate.device,
-                        dtype=self.momh_gate.dtype,
-                    )
+                    assign_row(h, vision_row)
                 for h in range(
                     self.momh_n_v_heads,
                     self.momh_n_v_heads + self.momh_n_t_heads,
                 ):
-                    self.momh_gate.data[h] = torch.tensor(
-                        [0.0, neg, neg, neg],
-                        device=self.momh_gate.device,
-                        dtype=self.momh_gate.dtype,
-                    )
+                    assign_row(h, text_row)
                 return
 
             delta = float(self.momh_soft_gating_init_strength)
             if self.momh_soft_gating_init == "tt_tv_split_warm":
                 split_point = self.n_heads // 2
-                self.momh_gate.data[:split_point, 0] = delta
-                self.momh_gate.data[:split_point, 1] = -delta
-                self.momh_gate.data[split_point:, 0] = -delta
-                self.momh_gate.data[split_point:, 1] = delta
+                first_half = (
+                    torch.arange(gate_data.shape[0], device=gate_data.device) + row_offset
+                ) < split_point
+                gate_data[first_half, 0] = delta
+                gate_data[first_half, 1] = -delta
+                gate_data[~first_half, 0] = -delta
+                gate_data[~first_half, 1] = delta
                 return
 
             if self.momh_soft_gating_init == "tt_tv_tvwarm":
-                self.momh_gate.data[:, 0] = -delta
-                self.momh_gate.data[:, 1] = delta
+                gate_data[:, 0] = -delta
+                gate_data[:, 1] = delta
                 return
 
             raise ValueError(
                 "momh_soft_gating_init must be one of "
                 f"{sorted(_SOFT_GATING_INIT_MODES)}, got {self.momh_soft_gating_init!r}"
             )
+
+    def _get_local_momh_gate_data(self) -> tuple[torch.Tensor, int]:
+        gate_data = self.momh_gate.data
+        if not hasattr(gate_data, "to_local"):
+            return gate_data, 0
+
+        row_offset = 0
+        placements = getattr(gate_data, "placements", ())
+        device_mesh = getattr(gate_data, "device_mesh", None)
+        coordinate = device_mesh.get_coordinate() if device_mesh is not None else None
+        for mesh_dim, placement in enumerate(placements):
+            if (
+                getattr(placement, "is_shard", lambda: False)()
+                and getattr(placement, "dim", None) == 0
+            ):
+                mesh_size = int(device_mesh.mesh.shape[mesh_dim])
+                mesh_rank = 0 if coordinate is None else int(coordinate[mesh_dim])
+                _, row_offset = placement.local_shard_size_and_offset(
+                    self.n_heads, mesh_size, mesh_rank
+                )
+                break
+        return gate_data.to_local(), row_offset
 
     def compute_momh_balance_aux_loss(self) -> torch.Tensor | None:
         if self.momh_balance_mode != "aux_loss" or not self.momh_soft_gating:
@@ -921,6 +949,8 @@ class NanoVLMModel(BaseModel):
                         nn.init.zeros_(module.bias)
                 elif isinstance(module, RMSNorm):
                     module.weight.data.fill_(1.0)
+            if getattr(layer.attn, "momh_soft_gating", False):
+                layer.attn._initialize_momh_gate()
 
         # Final norm
         self.norm.weight.data.fill_(1.0)

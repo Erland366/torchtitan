@@ -14,7 +14,357 @@ Each entry should include:
 
 <!-- New entries go above this line -->
 
+- **Date**: 2026-03-17
+- **Type**: Observation
+- **General description**: A weaker retained split-warm gate (`strength=1.0`) improved over the stronger static-gate recipes on full `mmstar`, but still did not beat the plain control or the earlier controller/aux long runs.
+- **Details**:
+  - Short screens:
+    - shared setup:
+      - `2x A100 40GB`
+      - `FSDP`
+      - `activation-checkpoint.mode=full`
+      - `global_batch_size=64`
+      - `local_batch_size=32`
+      - `steps=100`
+      - no packing
+      - W&B project: `patrickirawan-mbzuai/momh`
+    - `init_strength=1.0`
+      - config: `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm_low_gate_lr_init1`
+      - W&B: `https://wandb.ai/patrickirawan-mbzuai/momh/runs/b69bs51w`
+      - average `tt_tv_abs_mean`: `2.000032`
+      - average `tv_prob_mean`: `0.271521`
+      - average `tt_tv_signed_mean`: `-1.200010`
+      - average `tt_tv_signed_std`: `1.600033`
+      - final `loss_metrics/global_avg_loss = 4.3125`
+      - step-100 TPS about `34.4k`
+    - `init_strength=0.5`
+      - config: `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm_low_gate_lr_init05`
+      - W&B: `https://wandb.ai/patrickirawan-mbzuai/momh/runs/0wya7zkf`
+      - average `tt_tv_abs_mean`: `1.000081`
+      - average `tv_prob_mean`: `0.361352`
+      - average `tt_tv_signed_mean`: `-0.600067`
+      - average `tt_tv_signed_std`: `0.800051`
+      - final `loss_metrics/global_avg_loss = 4.375`
+      - step-100 TPS about `37.5k`
+  - `300`-step confirmation:
+    - config: `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_confirm_split_warm_low_gate_lr_init1`
+    - W&B: `https://wandb.ai/patrickirawan-mbzuai/momh/runs/63psptf8`
+    - average `tt_tv_abs_mean`: `1.999163`
+    - average `tv_prob_mean`: `0.271577`
+    - average `tt_tv_signed_mean`: `-1.199478`
+    - average `tt_tv_signed_std`: `1.599345`
+    - final `loss_metrics/global_avg_loss = 0.51562`
+    - final-step TPS about `35.0k`
+    - decision:
+      - promoted to a full `3000`-step run because it retained a clearly nontrivial gate while looking less rigid than the original `strength=2.0` recipe
+  - `3000`-step production run:
+    - config: `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_split_warm_low_gate_lr_init1`
+    - W&B: `https://wandb.ai/patrickirawan-mbzuai/momh/runs/zg3mm4cm`
+    - final metrics:
+      - `loss_metrics/global_avg_loss = 0.48242`
+      - `loss_metrics/global_max_loss = 0.55078`
+      - `grad_norm = 0.55038`
+      - `memory/max_reserved(GiB) = 23.66016`
+      - final-step TPS about `34.63k`
+    - retained checkpoints include:
+      - `step-2250`
+      - `step-2500`
+      - `step-2750`
+      - `step-3000`
+  - WSM merge + downstream eval:
+    - merged artifact:
+      - `outputs/soft_gating_weak_retention_20260316/merged/w1_init1_last4_mean`
+    - full `mmstar`, no limit:
+      - output: `eval_results/torchtitan/w1-init1-mmstar-full-20260316`
+      - backend: `torchtitan_nanovlm`
+      - `average,none = 0.3531268939`
+  - Updated ranking across all completed long-run soft-gating families:
+    - control: `0.3624798405`
+    - controller: `0.3560083661`
+    - aux-loss: `0.3538701372`
+    - weaker-init `W1 init1`: `0.3531268939`
+    - retained warm-start `R2`: `0.3494459090`
+    - freeze-thaw `R5`: `0.3475482593`
+    - pure frozen gate `FZ1`: `0.3434869139`
+  - Interpretation:
+    - reducing split-warm rigidity helped materially versus the stronger static-gate variants
+    - but the softer retained-gate recipe still did not beat the plain control or the earlier controller/aux long runs
+    - this suggests the current soft-gating bias family may be overfitting the proxy while still missing what `mmstar` rewards downstream
+
+- **Date**: 2026-03-16
+- **Type**: Observation
+- **General description**: A pure frozen-gate `3000`-step long run delivered the best throughput in the family, but the worst merged full-`mmstar` result.
+- **Details**:
+  - Recipe:
+    - config: `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_split_warm_frozen_gate`
+    - runtime contract:
+      - `2x A100 40GB`
+      - `FSDP`
+      - `activation-checkpoint.mode=full`
+      - `global_batch_size=64`
+      - `local_batch_size=32`
+      - `steps=3000`
+      - `checkpoint.interval=250`
+      - no packing
+      - W&B project: `patrickirawan-mbzuai/momh`
+  - Training outcome:
+    - W&B: `https://wandb.ai/patrickirawan-mbzuai/momh/runs/0im6o306`
+    - final metrics:
+      - `loss_metrics/global_avg_loss = 0.48828`
+      - `loss_metrics/global_max_loss = 0.55078`
+      - `grad_norm = 0.58254`
+      - `memory/max_reserved(GiB) = 23.66016`
+      - final-step TPS about `75.1k`
+    - retained checkpoints include:
+      - `step-2250`
+      - `step-2500`
+      - `step-2750`
+      - `step-3000`
+  - WSM merge + downstream eval:
+    - merged artifact:
+      - `outputs/soft_gating_frozen_gate_20260316/merged/fz1_last4_mean`
+    - full `mmstar`, no limit:
+      - output: `eval_results/torchtitan/fz1-frozen-gate-mmstar-full-20260316`
+      - backend: `torchtitan_nanovlm`
+      - `average,none = 0.3434869139`
+  - Ranking at that point:
+    - control: `0.3624798405`
+    - controller: `0.3560083661`
+    - aux-loss: `0.3538701372`
+    - retained warm-start `R2`: `0.3494459090`
+    - freeze-thaw `R5`: `0.3475482593`
+    - pure frozen gate `FZ1`: `0.3434869139`
+  - Interpretation:
+    - permanently freezing the strong gate gives a major systems win
+    - but it is the worst downstream quality result in the long-run soft-gating family
+    - this strongly argues against “hold a strong static gate all run” as the right recipe for `mmstar`
+
+- **Date**: 2026-03-16
+- **Type**: Observation
+- **General description**: The promoted freeze-thaw `3000`-step soft-gating run completed cleanly, but its merged full-`mmstar` score still underperformed every earlier long-run variant.
+- **Details**:
+  - Recipe:
+    - config: `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_split_warm_freeze_thaw_low_gate_lr`
+    - runtime contract:
+      - `2x A100 40GB`
+      - `FSDP`
+      - `activation-checkpoint.mode=full`
+      - `global_batch_size=64`
+      - `local_batch_size=32`
+      - `steps=3000`
+      - `checkpoint.interval=250`
+      - no packing
+  - Training outcome:
+    - W&B: `https://wandb.ai/erlandpg/torchtitan/runs/9w7nsu1m`
+    - final metrics:
+      - `loss_metrics/global_avg_loss = 0.48438`
+      - `loss_metrics/global_max_loss = 0.55078`
+      - `grad_norm = 0.56847`
+      - `memory/max_reserved(GiB) = 23.66016`
+      - final-step TPS about `35.39k`
+    - retained checkpoints include:
+      - `step-2250`
+      - `step-2500`
+      - `step-2750`
+      - `step-3000`
+  - WSM merge + downstream eval:
+    - merged artifact:
+      - `outputs/soft_gating_freeze_thaw_20260316/merged/r5_last4_mean`
+    - full `mmstar`, no limit:
+      - output: `eval_results/torchtitan/r5-freeze-thaw-mmstar-full-20260316`
+      - backend: `torchtitan_nanovlm`
+      - `average,none = 0.3475482593`
+  - Updated ranking across all completed long-run soft-gating families:
+    - control: `0.3624798405`
+    - controller: `0.3560083661`
+    - aux-loss: `0.3538701372`
+    - retained warm-start `R2`: `0.3494459090`
+    - freeze-thaw `R5`: `0.3475482593`
+  - Interpretation:
+    - freeze-thaw preserved the strong gate and trained stably
+    - but the schedule still made downstream quality worse than the plain control
+    - this means the next high-value ablation, if this line continues, is a true long-run pure frozen-gate run rather than more freeze-thaw tuning
+
 ## 2026-03-15
+
+- **Date**: 2026-03-16
+- **Type**: Retrospective
+- **General description**: Promoted the corrected retained-warm-start recipe to a full `3000`-step WSM run and found that strong stable actuation still did not beat the earlier soft-gating baselines on full `mmstar`.
+- **Details**:
+  - Promoted long-run recipe:
+    - config family: `tt_tv_split_warm + lr_momh_gate=1e-5`
+    - runtime contract:
+      - `2x A100 40GB`
+      - `FSDP`
+      - `activation-checkpoint.mode=full`
+      - `global_batch_size=64`
+      - `local_batch_size=32`
+      - `steps=3000`
+      - `checkpoint.interval=250`
+      - no packing
+  - `300`-step confirmation:
+    - W&B: `https://wandb.ai/erlandpg/torchtitan/runs/fdhanp6f`
+    - outcome:
+      - completed cleanly
+      - final step `300` TPS about `34.6k`
+      - `loss_metrics/global_avg_loss = 0.53125`
+    - decision:
+      - promoted to the full `3000`-step run because the retained-warm-start recipe remained stable and fast
+  - `3000`-step production run:
+    - W&B: `https://wandb.ai/erlandpg/torchtitan/runs/vusfmvt0`
+    - final metrics:
+      - `loss_metrics/global_avg_loss = 0.48438`
+      - `loss_metrics/global_max_loss = 0.55078`
+      - `grad_norm = 0.57219`
+      - `memory/max_reserved(GiB) = 23.66016`
+      - `memory/num_ooms = 0`
+      - final-step TPS about `35,093`
+    - retained checkpoints include:
+      - `step-2250`
+      - `step-2500`
+      - `step-2750`
+      - `step-3000`
+  - WSM merge + downstream eval:
+    - merged artifact:
+      - `outputs/soft_gating_retention_20260316/merged/r2_last4_mean`
+    - full `mmstar`, no limit:
+      - output: `eval_results/torchtitan/r2-mmstar-full-validate-20260316`
+      - backend: `torchtitan_nanovlm`
+      - `average,none = 0.3494459090`
+  - Comparison against the earlier long-run family:
+    - control: `0.3624798405`
+    - controller: `0.3560083661`
+    - aux-loss: `0.3538701372`
+    - retained warm-start `R2`: `0.3494459090`
+  - Interpretation:
+    - the corrected warm-start/retention recipe is a valid and strong systems result:
+      - strong actuation
+      - stable long-run training
+      - healthy throughput and VRAM
+    - but it is not a quality win on `mmstar`
+    - strong retained actuation is therefore not sufficient; the remaining problem is usefulness, not strength or simple retention
+  - Updated recommendation:
+    - stop pushing static retained specialization as the main direction
+    - next mechanism should be schedule-based, with freeze-thaw the highest-probability candidate
+    - continue to require merged downstream eval, not training loss or gate metrics alone, as the promotion gate
+
+- **Date**: 2026-03-15
+- **Type**: Retrospective
+- **General description**: Corrected the soft-gating story after fixing warm-start initialization: the real issue is no longer weak scores, but retaining useful strong specialization over training.
+- **Details**:
+  - Consolidated conclusion from the full `3000`-step WSM family plus the corrected actuation and retention screens:
+    - the first long-run comparison still stands: plain control beat controller and aux-loss on full `mmstar`
+    - the original “warm start collapses immediately” interpretation does not stand, because those runs were invalid before the `init_weights()` fix
+  - What now appears true:
+    - `tt_tv_split_warm` already produces strong runtime actuation when initialization survives the real `to_empty(...)+init_weights()+FSDP` path
+    - the strongest practical short-run trainable recipe so far is `split_warm + lr_momh_gate=1e-5`
+    - the frozen-gate run is the current ceiling for exact retention and early throughput
+  - What failed:
+    - per-head controller balancing was too neutral in the long run
+    - scale-only controller sweeps improved the proxy metrics but never came close to justifying another `3000`-step run
+    - adding a gentle layer-mean controller on top of the corrected warm start did not beat low gate LR alone in the `100`-step retention screen
+  - Updated recommendation:
+    - stop treating “make the gate stronger” as the main problem
+    - promote the low-gate-LR warm-start recipe first
+    - treat freeze-thaw scheduling as the next new mechanism if longer runs still wash out the useful specialization
+
+- **Date**: 2026-03-15
+- **Type**: Benchmark
+- **General description**: Ran the corrected `100`-step warm-start retention screen family and found that strong soft-gating actuation now survives through step `100`; the best practical trainable variant is split warm init with a lower gate LR.
+- **Details**:
+  - Shared setup:
+    - `2x A100 40GB`
+    - `FSDP`
+    - `activation-checkpoint.mode=full`
+    - `global_batch_size=64`
+    - `local_batch_size=32`
+    - `steps=100`
+    - no packing
+    - W&B enabled
+  - Results:
+    - `R1` split warm baseline
+      - config: `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm`
+      - W&B: `https://wandb.ai/erlandpg/torchtitan/runs/1piu5o9q`
+      - average `tt_tv_abs_mean`: `3.9990`
+      - average `tv_prob_mean`: `0.2108`
+      - loss: `4.375`
+      - throughput: `32105.2`
+    - `R2` split warm + low gate LR
+      - config: `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm_low_gate_lr`
+      - W&B: `https://wandb.ai/erlandpg/torchtitan/runs/cvlgcd9q`
+      - average `tt_tv_abs_mean`: `3.9999`
+      - average `tv_prob_mean`: `0.2108`
+      - loss: `4.34375`
+      - throughput: `33575.0`
+    - `R3` split warm + low gate LR + gentle layer-mean controller
+      - config: `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_layer_mean_wsm_screen_split_warm_low_gate_lr`
+      - W&B: `https://wandb.ai/erlandpg/torchtitan/runs/085jqs1n`
+      - average `tt_tv_abs_mean`: `3.9826`
+      - average `tv_prob_mean`: `0.2113`
+      - loss: `4.34375`
+      - throughput: `33413.1`
+    - `R4` split warm + frozen gate
+      - config: `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm_frozen_gate`
+      - W&B: `https://wandb.ai/erlandpg/torchtitan/runs/4x73elww`
+      - average `tt_tv_abs_mean`: `4.0`
+      - average `tv_prob_mean`: `0.5536`
+      - loss: `4.375`
+      - throughput: `74660.1`
+  - Interpretation:
+    - the corrected warm-start path is now strong enough and stable enough through `100` steps; the old “actuation is too weak” conclusion is no longer valid
+    - lowering `lr_momh_gate` to `1e-5` preserves the strong warm start essentially perfectly while remaining fully trainable
+    - the gentle layer-mean controller does not buy a meaningful balance shift over `100` steps and slightly reduces actuation
+    - freezing the gate gives a major throughput win and preserves the warm-start exactly, which makes a future freeze-thaw schedule the most plausible next mechanism if we want both strong specialization and later adaptability
+
+- **Date**: 2026-03-15
+- **Type**: Validation
+- **General description**: Re-ran short `tt_tv_split_warm` screens after fixing warm-start initialization through `init_weights()` and confirmed that soft-gating actuation is now genuinely strong at runtime.
+- **Details**:
+  - Fixed implementation details:
+    - `NanoVLMModel.init_weights()` now reapplies `layer.attn._initialize_momh_gate()` after `to_empty(...)`.
+    - `_initialize_momh_gate()` now writes through the DTensor local shard with the correct global row offset, so it works under FSDP-managed parameters.
+    - frozen-gate metrics also force a symmetric global reduction under FSDP.
+  - Focused validation:
+    - unit tests: `pytest tests/unit_tests/test_nanovlm_soft_gating_balance.py` → `18 passed`
+  - Corrected short distributed screens (`2x A100 40GB`, `FSDP`, `activation-checkpoint.mode=full`, `steps=10`):
+    - frozen gate:
+      - config: `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm_frozen_gate`
+      - W&B: `https://wandb.ai/erlandpg/torchtitan/runs/0foz4aah`
+      - layerwise `tt_tv_abs_mean`: exactly `4.0` across all `30` decoder layers
+      - layerwise `tt_tv_abs_max`: `4.0`
+      - throughput at step `10`: about `47.5k tps`
+      - interpretation: frozen warm-start gates now survive model construction and FSDP runtime exactly as intended
+    - unfrozen split warm:
+      - config: `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm`
+      - W&B: `https://wandb.ai/erlandpg/torchtitan/runs/s6t2he56`
+      - layerwise `tt_tv_abs_mean`: about `4.0` across all `30` layers after `10` steps
+      - layerwise `tt_tv_abs_max`: about `4.0`
+      - example layer-0 metrics:
+        - `tt_prob_mean`: `0.7892`
+        - `tv_prob_mean`: `0.2108`
+        - `tt_tv_signed_mean`: `-2.3999`
+        - `tt_tv_signed_std`: `3.2003`
+      - throughput at step `10`: about `33.9k tps`
+      - interpretation: the actuation is now strong even without freezing the gate; earlier “warm init collapses immediately” conclusions were artifacts of the init bug
+  - Consequence:
+    - the next design cycle should no longer focus on “make the score stronger” as a generic problem.
+    - the new question is how to preserve useful strong specialization over `100-3000` steps without letting LM gradients wash it out or making the routing too rigid.
+
+- **Date**: 2026-03-15
+- **Type**: Diagnosis
+- **General description**: Identified that `tt_tv` warm-start screens were invalid because `momh_gate` initialization was being applied in attention construction but not re-applied after TorchTitan's `to_empty(...)+init_weights()` path.
+- **Details**:
+  - `NanoVLMGQAttention.__init__` correctly applied `momh_soft_gating_init`, but `Trainer` later rebuilt parameter storage with `model.to_empty(...)` and then called `model.init_weights()`.
+  - `NanoVLMModel.init_weights()` reinitialized linear/norm/embedding parameters but did not restore `layer.attn.momh_gate`, so warm-start and frozen-gate runs effectively started from the default gate state instead of the requested `tt_tv_split_warm` or `tt_tv_tvwarm` values.
+  - This explains two previously confusing observations:
+    - all unfrozen warm-start variants converged back to nearly identical tiny actuation bands;
+    - frozen-gate runs logged zero gate-effect summaries even after the FSDP logging fix, because the intended warm-start gate never survived model initialization.
+  - Fix:
+    - `NanoVLMModel.init_weights()` now calls `layer.attn._initialize_momh_gate()` for soft-gated decoder blocks.
+    - Added a regression test that zeroes the gate, calls `model.init_weights()`, and verifies the configured split-warm pattern is restored.
+  - Consequence:
+    - the second warm-start actuation cycle before this fix should not be treated as valid evidence about warm-init effectiveness.
+    - the next controller/warm-start screen must be rerun from scratch after the init fix.
 
 - **Date**: 2026-03-15
 - **Type**: Observation

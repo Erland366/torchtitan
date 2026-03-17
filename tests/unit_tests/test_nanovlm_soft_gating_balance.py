@@ -195,6 +195,19 @@ def test_compute_momh_balance_aux_loss_tracks_gate_proxy():
     assert balance_loss.item() > 0.0
 
 
+def _assert_tt_tv_split_warm_gate(gate: torch.Tensor, delta: float) -> None:
+    half = gate.shape[0] // 2
+    kwargs = {"device": gate.device, "dtype": gate.dtype}
+    assert torch.equal(gate[:half, 0], torch.full((half,), delta, **kwargs))
+    assert torch.equal(gate[:half, 1], torch.full((half,), -delta, **kwargs))
+    assert torch.equal(
+        gate[half:, 0], torch.full((gate.shape[0] - half,), -delta, **kwargs)
+    )
+    assert torch.equal(
+        gate[half:, 1], torch.full((gate.shape[0] - half,), delta, **kwargs)
+    )
+
+
 def test_tt_tv_split_warm_initializes_opposing_head_groups():
     attn = NanoVLMGQAttention(
         SimpleNamespace(
@@ -210,11 +223,7 @@ def test_tt_tv_split_warm_initializes_opposing_head_groups():
         )
     )
 
-    gate = attn.momh_gate.detach()
-    assert torch.equal(gate[:2, 0], torch.full((2,), 2.0))
-    assert torch.equal(gate[:2, 1], torch.full((2,), -2.0))
-    assert torch.equal(gate[2:, 0], torch.full((2,), -2.0))
-    assert torch.equal(gate[2:, 1], torch.full((2,), 2.0))
+    _assert_tt_tv_split_warm_gate(attn.momh_gate.detach(), delta=2.0)
 
 
 def test_tt_tv_tvwarm_initializes_all_heads_toward_tv():
@@ -235,6 +244,40 @@ def test_tt_tv_tvwarm_initializes_all_heads_toward_tv():
     gate = attn.momh_gate.detach()
     assert torch.equal(gate[:, 0], torch.full((4,), -1.5))
     assert torch.equal(gate[:, 1], torch.full((4,), 1.5))
+
+
+def test_model_init_weights_reapplies_tt_tv_split_warm():
+    cfg = NanoVLMModel.Config(
+        vit_hidden_dim=16,
+        vit_inter_dim=32,
+        vit_patch_size=4,
+        vit_img_size=8,
+        vit_n_heads=2,
+        vit_n_blocks=1,
+        vit_cls_flag=False,
+        lm_hidden_dim=16,
+        lm_inter_dim=32,
+        lm_n_heads=4,
+        lm_n_kv_heads=2,
+        lm_n_blocks=1,
+        lm_vocab_size=32,
+        mp_pixel_shuffle_factor=1,
+        mp_image_token_length=4,
+        momh_enabled=True,
+        momh_soft_gating=True,
+        momh_soft_gating_pairs="tt_tv",
+        momh_soft_gating_init="tt_tv_split_warm",
+        momh_soft_gating_init_strength=2.0,
+    )
+    cfg.update_from_config(trainer_config=SimpleNamespace(dataloader=None))
+
+    model = NanoVLMModel(cfg)
+    with torch.no_grad():
+        model.layers["0"].attn.momh_gate.zero_()
+
+    model.init_weights()
+
+    _assert_tt_tv_split_warm_gate(model.layers["0"].attn.momh_gate.detach(), delta=2.0)
 
 
 def test_generate_soft_gating_score_mod_applies_gate_scale():
@@ -331,7 +374,12 @@ class _HookDummyModel(nn.Module):
 
 class _DummyOptimizers:
     def __init__(self) -> None:
+        self.pre_hook = None
         self.hook = None
+        self.optimizers = []
+
+    def register_step_pre_hook(self, hook):
+        self.pre_hook = hook
 
     def register_step_post_hook(self, hook):
         self.hook = hook
@@ -393,3 +441,111 @@ def test_layer_mean_controller_applies_uniform_tt_tv_shift():
     assert torch.allclose(tv_update, tv_update[0].expand_as(tv_update))
     assert tt_update[0].item() < 0.0
     assert tv_update[0].item() > 0.0
+
+
+def test_frozen_gate_metrics_fallback_to_global_reduction(monkeypatch):
+    optimizers = _DummyOptimizers()
+    model = _HookDummyModel()
+    model.layers["0"].attn.momh_gate = nn.Parameter(
+        torch.zeros(0, 4, dtype=torch.float32),
+        requires_grad=False,
+    )
+    model.layers["0"].attn.momh_balance_mode = "off"
+    model.layers["0"].attn.momh_gate_metrics_mode = "local"
+
+    class _FakeReduceOp:
+        SUM = "sum"
+        MAX = "max"
+
+    def _fake_is_initialized():
+        return True
+
+    def _fake_get_rank():
+        return 0
+
+    reduced_sum_stats = torch.tensor(
+        [
+            1.0,
+            1.0,
+            0.0,
+            0.0,
+            2.0,
+            1.6,
+            0.4,
+            0.02,
+            -0.6,
+            8.0,
+            -8.0,
+            32.0,
+        ],
+        dtype=torch.float32,
+    )
+
+    def _fake_all_reduce(tensor, op=None):
+        del op
+        if tensor.numel() == 12:
+            tensor.copy_(reduced_sum_stats.to(dtype=tensor.dtype, device=tensor.device))
+        elif tensor.numel() == 1:
+            tensor.fill_(4.5)
+        else:
+            raise AssertionError(f"unexpected all_reduce tensor shape: {tuple(tensor.shape)}")
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", _fake_is_initialized)
+    monkeypatch.setattr(torch.distributed, "get_rank", _fake_get_rank)
+    monkeypatch.setattr(torch.distributed, "all_reduce", _fake_all_reduce)
+    monkeypatch.setattr(torch.distributed, "ReduceOp", _FakeReduceOp)
+
+    nanovlm_post_optimizer_build_fn(
+        optimizers,
+        [model],
+        parallel_dims=SimpleNamespace(),
+    )
+
+    assert optimizers.hook is not None
+    optimizers.hook()
+
+    metrics = model._nanovlm_extra_metrics
+    assert metrics["momh_gate_effect/layer_0/tt_tv_abs_mean"] == pytest.approx(4.0)
+    assert metrics["momh_gate_effect/layer_0/tt_tv_abs_max"] == pytest.approx(4.5)
+    assert metrics["momh_gate_effect/layer_0/tt_tv_signed_mean"] == pytest.approx(-4.0)
+    assert metrics["momh_gate_effect/layer_0/tt_tv_signed_std"] == pytest.approx(0.0)
+
+
+def test_freeze_thaw_pre_hook_zeroes_gate_lr_until_thaw_step():
+    optimizers = _DummyOptimizers()
+    model = _HookDummyModel()
+    optimizers.optimizers = [
+        SimpleNamespace(
+            param_groups=[
+                {
+                    "name": "momh_gate",
+                    "lr": 1e-5,
+                    "max_lr": 1e-5,
+                    "freeze_steps": 2,
+                }
+            ]
+        )
+    ]
+    model.layers["0"].attn.momh_balance_mode = "off"
+    nanovlm_post_optimizer_build_fn(
+        optimizers,
+        [model],
+        parallel_dims=SimpleNamespace(),
+    )
+
+    assert optimizers.pre_hook is not None
+    assert optimizers.hook is not None
+    gate_group = optimizers.optimizers[0].param_groups[0]
+
+    optimizers.pre_hook()
+    assert gate_group["lr"] == pytest.approx(0.0)
+    optimizers.hook()
+    gate_group["lr"] = gate_group["max_lr"]
+
+    optimizers.pre_hook()
+    assert gate_group["lr"] == pytest.approx(0.0)
+    optimizers.hook()
+    gate_group["lr"] = gate_group["max_lr"]
+
+    optimizers.pre_hook()
+    assert gate_group["lr"] == pytest.approx(1e-5)

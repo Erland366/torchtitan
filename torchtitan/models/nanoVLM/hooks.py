@@ -51,6 +51,8 @@ def nanovlm_post_optimizer_build_fn(
     pair_names = ["tt", "tv", "vt", "vv"]
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     step_idx = 0
+    freeze_thaw_logged = False
+    thaw_logged = False
 
     def _to_local_if_needed(tensor: torch.Tensor) -> torch.Tensor:
         if hasattr(tensor, "to_local"):
@@ -130,6 +132,34 @@ def nanovlm_post_optimizer_build_fn(
             ),
         )
 
+    def _apply_momh_gate_freeze_thaw(*args, **kwargs) -> None:
+        nonlocal freeze_thaw_logged, thaw_logged
+        del args, kwargs
+
+        current_step = step_idx + 1
+        for optimizer in optimizers.optimizers:
+            for param_group in optimizer.param_groups:
+                if param_group.get("name") != "momh_gate":
+                    continue
+                freeze_steps = int(param_group.get("freeze_steps", 0))
+                if freeze_steps <= 0:
+                    continue
+                max_lr = float(param_group.get("max_lr", param_group["lr"]))
+                if current_step <= freeze_steps:
+                    param_group["lr"] = 0.0
+                    if rank == 0 and not freeze_thaw_logged:
+                        logger.info(
+                            "Freeze-thaw: clamping momh_gate lr to 0 for "
+                            f"the first {freeze_steps} optimizer steps"
+                        )
+                        freeze_thaw_logged = True
+                elif rank == 0 and not thaw_logged:
+                    logger.info(
+                        "Freeze-thaw: thawed momh_gate optimizer updates at "
+                        f"step {current_step} (target lr={max_lr})"
+                    )
+                    thaw_logged = True
+
     def _collect_momh_gate_metrics(*args, **kwargs):
         """Optimizer post-step hook: stash gate statistics on the model."""
         nonlocal step_idx
@@ -143,24 +173,22 @@ def nanovlm_post_optimizer_build_fn(
             if first_block is None:
                 continue
 
-            metrics_enabled = bool(
-                getattr(first_block.attn, "momh_gate_metrics_enabled", False)
-            )
-            balance_mode = str(getattr(first_block.attn, "momh_balance_mode", "off"))
+            attn = first_block.attn
+            metrics_enabled = bool(getattr(attn, "momh_gate_metrics_enabled", False))
+            balance_mode = str(getattr(attn, "momh_balance_mode", "off"))
             controller_enabled = balance_mode == "controller"
-            target_tv = float(first_block.attn.momh_balance_target_tv)
-            gate_scale = float(first_block.attn.momh_soft_gating_scale)
-            balance_signal = str(getattr(first_block.attn, "momh_balance_signal", "gate_prob"))
+            target_tv = float(attn.momh_balance_target_tv)
+            gate_scale = float(attn.momh_soft_gating_scale)
+            update_rate = float(attn.momh_balance_update_rate)
+            balance_signal = str(getattr(attn, "momh_balance_signal", "gate_prob"))
 
-            metrics_mode = str(getattr(first_block.attn, "momh_gate_metrics_mode", "local"))
+            metrics_mode = str(getattr(attn, "momh_gate_metrics_mode", "local"))
             if metrics_mode not in {"local", "global"}:
                 raise ValueError(
                     "momh_gate_metrics_mode must be one of {'local', 'global'}, "
                     f"got {metrics_mode!r}"
                 )
-            metrics_interval = int(
-                getattr(first_block.attn, "momh_gate_metrics_interval", 50)
-            )
+            metrics_interval = int(getattr(attn, "momh_gate_metrics_interval", 50))
             if metrics_interval <= 0:
                 raise ValueError(
                     "momh_gate_metrics_interval must be > 0, "
@@ -186,13 +214,12 @@ def nanovlm_post_optimizer_build_fn(
                     if balance_signal == "gate_prob":
                         updates = torch.sign(target_tv - tv_prob_local).to(
                             gate_data.dtype
-                        ) * float(first_block.attn.momh_balance_update_rate)
+                        ) * update_rate
                     elif balance_signal == "layer_mean_gate_prob":
                         mean_error = float(target_tv - tv_prob_local.mean().item())
                         updates = torch.full(
                             (gate_data.shape[0],),
-                            float(first_block.attn.momh_balance_update_rate)
-                            * mean_error,
+                            update_rate * mean_error,
                             device=gate_data.device,
                             dtype=gate_data.dtype,
                         )
@@ -229,7 +256,15 @@ def nanovlm_post_optimizer_build_fn(
                     gate_scale=gate_scale,
                 )
 
-                if metrics_mode == "global" and torch.distributed.is_initialized():
+                # Frozen gate params can legitimately have empty local shards on
+                # rank 0 under FSDP, which makes "local" logging misleadingly
+                # look like zero actuation. In that case, force a symmetric
+                # global reduction so the logged metric reflects the real gate.
+                reduce_globally = torch.distributed.is_initialized() and (
+                    metrics_mode == "global" or not gate_param.requires_grad
+                )
+
+                if reduce_globally:
                     sum_stats = torch.cat(
                         [
                             local_sum,
@@ -268,18 +303,14 @@ def nanovlm_post_optimizer_build_fn(
                     global_tv_sum = float(local_tv_sum.item())
                     global_balance_sum = float(local_balance_sum.item())
                     global_tv_error_sum = float(local_tv_error_sum.item())
-                    global_effective_abs_delta_sum = float(
-                        local_effective_abs_delta_sum.item()
-                    )
+                    global_effective_abs_delta_sum = float(local_effective_abs_delta_sum.item())
                     global_effective_signed_delta_sum = float(
                         local_effective_signed_delta_sum.item()
                     )
                     global_effective_signed_delta_sq_sum = float(
                         local_effective_signed_delta_sq_sum.item()
                     )
-                    global_effective_abs_delta_max = float(
-                        local_effective_abs_delta_max.item()
-                    )
+                    global_effective_abs_delta_max = float(local_effective_abs_delta_max.item())
 
                 if rank == 0 and global_count > 0.0:
                     signed_mean = global_effective_signed_delta_sum / global_count
@@ -324,4 +355,5 @@ def nanovlm_post_optimizer_build_fn(
                 merged.update(extra)
                 model_part._nanovlm_extra_metrics = merged
 
+    optimizers.register_step_pre_hook(_apply_momh_gate_freeze_thaw)
     optimizers.register_step_post_hook(_collect_momh_gate_metrics)

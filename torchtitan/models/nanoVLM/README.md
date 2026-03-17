@@ -202,6 +202,15 @@ variants:
 - `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_wsm_screen_c4`
 - `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm`
 - `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_layer_mean_wsm_screen_split_warm`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm_low_gate_lr`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm_low_gate_lr_init1`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm_low_gate_lr_init05`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_confirm_split_warm_low_gate_lr_init1`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_split_warm_low_gate_lr_init1`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm_freeze_thaw_low_gate_lr`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_split_warm_frozen_gate`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_split_warm_freeze_thaw_low_gate_lr`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_layer_mean_wsm_screen_split_warm_low_gate_lr`
 - `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_tvwarm`
 - `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_screen_split_warm_frozen_gate`
 - `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_balance_controller_layer_mean_wsm_screen_split_warm_frozen_gate`
@@ -218,6 +227,26 @@ Operational guidance:
 - the `split_warm*` screen variants are the next-cycle actuation experiments:
   they test `tt_tv`-specific warm-starts, optional layer-mean controller updates,
   and an optional frozen-gate mode that removes the gate from LM-gradient updates
+- the `split_warm*_low_gate_lr` variants keep the same strong warm-start but
+  lower `lr_momh_gate` so the gate evolves more slowly than the LM weights
+- the `split_warm_low_gate_lr_init1` and `split_warm_low_gate_lr_init05`
+  variants use the same reduced gate LR but weaken the initial split-warm
+  bias to `1.0` and `0.5` respectively for rigidity screens
+- the `confirm_split_warm_low_gate_lr_init1` variant is the matching `300`-step
+  confirmation run for the `strength=1.0` winner, with checkpointing restored
+  at interval `100` and sparse local gate metrics at interval `25`
+- the `wsm_split_warm_low_gate_lr_init1` variant is the matching `3000`-step
+  long-run recipe for that weaker split-warm setting, using the standard WSM
+  checkpoint cadence and sparse local gate metrics
+- the `split_warm*_freeze_thaw_low_gate_lr` variant uses the same low gate LR,
+  but clamps gate updates to zero for the first `50` optimizer steps before
+  thawing back to `lr_momh_gate`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_split_warm_frozen_gate`
+  is the pure long-run frozen-gate ablation: the split warm init is kept fixed
+  for the entire run by setting `lr_momh_gate=0`
+- `nanovlm_230m_momh_soft_gating_b5_tttv_nopack_wsm_split_warm_freeze_thaw_low_gate_lr`
+  is the promoted long-run version of that recipe, with sparse local gate
+  metrics and the standard WSM checkpoint cadence
 
 ### Optional soft-gating balance controls
 
@@ -244,12 +273,23 @@ Current limitations:
 - balance mode is not supported with pipeline parallelism
 - the `tt_tv`-specific warm starts require `momh_soft_gating_pairs="tt_tv"`
 - v1 balances the gate proxy only; it does not recover runtime attention-pair usage
+
+Optimizer controls relevant to retention experiments:
+- `optimizer.lr_momh_gate`: dedicated learning rate for the `momh_gate` param group
+- `optimizer.momh_gate_freeze_steps`: clamp the effective `momh_gate` optimizer
+  LR to zero for the first N optimizer steps, then thaw back to its scheduled
+  `lr_momh_gate` automatically
 - `momh_soft_gating_scale` changes how strongly the gate affects attention, but
   the balance controller still reads the raw `tt`/`tv` gate proxy, so controller
   tuning and attention-strength tuning remain separate knobs
 - under FSDP, aux-loss uses the local `momh_gate` shard and normalizes by the
   total layer head count so it avoids mixing DTensor scalars into the trainer's
   main loss path
+- warm-start gate initialization is applied again inside `NanoVLMModel.init_weights()`
+  so it survives TorchTitan's `to_empty(...)+init_weights()` construction path
+- under FSDP, frozen-gate diagnostics automatically upgrade from local-shard
+  logging to a symmetric global reduction, because rank-0-only local shards can
+  otherwise report misleading zero actuation
 
 Logged diagnostics include:
 - `train/momh_balance_aux_loss` for auxiliary-loss runs
